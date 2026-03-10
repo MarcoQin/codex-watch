@@ -861,6 +861,10 @@ class TelegramAPI:
             payload["text"] = text
         self._call("answerCallbackQuery", payload)
 
+    def set_my_commands(self, commands: List[Dict[str, str]]) -> None:
+        payload: Dict[str, Any] = {"commands": commands}
+        self._call("setMyCommands", payload)
+
 
 class TmuxController:
     @staticmethod
@@ -1349,6 +1353,8 @@ class SessionMonitor(threading.Thread):
 
 
 class TelegramService(threading.Thread):
+    SESSIONS_PAGE_SIZE = 6
+
     def __init__(self, cfg: Config, db: DB, bus: NotificationBus, stop_event: threading.Event):
         super().__init__(daemon=True)
         self.cfg = cfg
@@ -1375,6 +1381,7 @@ class TelegramService(threading.Thread):
             self.api.read_timeout_sec,
             self.api.request_timeout_sec,
         )
+        self._register_bot_commands()
         try:
             self._initialize_update_offset()
         except Exception:
@@ -1441,6 +1448,154 @@ class TelegramService(threading.Thread):
         if next_offset is not None:
             self.update_offset = next_offset
             self.db.set_kv("telegram.update_offset", str(next_offset))
+
+    def _register_bot_commands(self) -> None:
+        commands = [
+            {"command": "help", "description": "Show help"},
+            {"command": "menu", "description": "Show quick action keyboard"},
+            {"command": "sessions", "description": "List/select managed sessions"},
+            {"command": "select", "description": "Select a managed session"},
+            {"command": "status", "description": "Show selected session status"},
+            {"command": "mode", "description": "Switch mode: /mode <plan|default>"},
+            {"command": "approve", "description": "Approve pending action"},
+            {"command": "reject", "description": "Reject pending action"},
+            {"command": "send", "description": "Send text to selected session"},
+            {"command": "bind", "description": "Bind chat: /bind <binding_id>"},
+            {"command": "unbind", "description": "Unbind this chat"},
+        ]
+        try:
+            self.api.set_my_commands(commands)
+            logging.info("telegram commands registered: %s", len(commands))
+        except Exception:
+            logging.exception("failed to register telegram commands")
+
+    def _main_menu_keyboard(self) -> Dict[str, Any]:
+        return {
+            "keyboard": [
+                [{"text": "Sessions"}, {"text": "Select"}, {"text": "Status"}, {"text": "Help"}],
+                [{"text": "Plan"}, {"text": "Default"}, {"text": "Approve"}, {"text": "Reject"}],
+            ],
+            "resize_keyboard": True,
+            "is_persistent": True,
+            "one_time_keyboard": False,
+        }
+
+    def _send_main_menu(self, chat_id: int, text: str) -> None:
+        self._reply(chat_id, text, reply_markup=self._main_menu_keyboard())
+
+    def _normalize_message_text(self, text: str) -> str:
+        mapping = {
+            "Sessions": "/sessions",
+            "Select": "/select",
+            "Status": "/status",
+            "Help": "/help",
+            "Menu": "/menu",
+            "Plan": "/mode plan",
+            "Default": "/mode default",
+            "Approve": "/approve",
+            "Reject": "/reject",
+        }
+        normalized = text.strip()
+        return mapping.get(normalized, normalized)
+
+    def _managed_sessions_sorted(self) -> List[sqlite3.Row]:
+        managed = self.db.list_managed_sessions()
+        return sorted(managed, key=lambda row: str(row["alias"]).lower())
+
+    def _selected_alias(self, chat_id: int) -> Optional[str]:
+        ref = self.db.get_selected_session(chat_id)
+        if not ref:
+            return None
+        if ref.startswith("alias:"):
+            return ref.split(":", 1)[1]
+        if ref.startswith("session:"):
+            sid = ref.split(":", 1)[1]
+            row = self.db.get_managed_by_session_id(sid)
+            if row:
+                return str(row["alias"])
+        return None
+
+    def _render_sessions_page(self, chat_id: int, page: int) -> Tuple[str, Optional[Dict[str, Any]], int]:
+        managed = self._managed_sessions_sorted()
+        lines = ["[Codex] managed sessions"]
+        if not managed:
+            lines.append("- none")
+            return "\n".join(lines), None, 0
+
+        total_pages = (len(managed) + self.SESSIONS_PAGE_SIZE - 1) // self.SESSIONS_PAGE_SIZE
+        page = max(0, min(page, total_pages - 1))
+        start = page * self.SESSIONS_PAGE_SIZE
+        end = min(start + self.SESSIONS_PAGE_SIZE, len(managed))
+        selected_alias = self._selected_alias(chat_id)
+
+        buttons: List[List[Dict[str, str]]] = []
+        for idx, row in enumerate(managed[start:end]):
+            alias = str(row["alias"])
+            status = str(row["status"])
+            sid = str(row["codex_session_id"] or "-")
+            active = alias == selected_alias
+            marker = "*" if active else " "
+            lines.append(f"{start + idx + 1}. {marker} {alias} | {status} | sid={sid}")
+            button_text = f"{'[*] ' if active else ''}{alias} ({status})"
+            callback = f"sl|s|{page}|{idx}"
+            buttons.append([{"text": button_text[:64], "callback_data": callback[:64]}])
+
+        lines.append(f"page: {page + 1}/{total_pages}")
+        nav: List[Dict[str, str]] = []
+        if page > 0:
+            nav.append({"text": "Prev", "callback_data": f"sl|p|{page - 1}"[:64]})
+        if page < total_pages - 1:
+            nav.append({"text": "Next", "callback_data": f"sl|p|{page + 1}"[:64]})
+        if nav:
+            buttons.append(nav)
+
+        return "\n".join(lines), {"inline_keyboard": buttons}, page
+
+    def _handle_sessions_callback(self, cb_id: str, chat_id: int, parts: List[str]) -> None:
+        if len(parts) < 3:
+            self.api.answer_callback_query(cb_id, "Invalid callback data")
+            return
+        action = parts[1]
+        if action == "p":
+            if len(parts) != 3:
+                self.api.answer_callback_query(cb_id, "Invalid callback data")
+                return
+            try:
+                page = int(parts[2])
+            except ValueError:
+                self.api.answer_callback_query(cb_id, "Invalid callback data")
+                return
+            text, keyboard, _ = self._render_sessions_page(chat_id, page)
+            self.api.send_message(chat_id, text, reply_markup=keyboard)
+            self.api.answer_callback_query(cb_id, "Updated")
+            return
+
+        if action == "s":
+            if len(parts) != 4:
+                self.api.answer_callback_query(cb_id, "Invalid callback data")
+                return
+            try:
+                page = int(parts[2])
+                index_in_page = int(parts[3])
+            except ValueError:
+                self.api.answer_callback_query(cb_id, "Invalid callback data")
+                return
+            if page < 0 or index_in_page < 0:
+                self.api.answer_callback_query(cb_id, "Invalid callback data")
+                return
+            managed = self._managed_sessions_sorted()
+            target = (page * self.SESSIONS_PAGE_SIZE) + index_in_page
+            if target < 0 or target >= len(managed):
+                self.api.answer_callback_query(cb_id, "Stale list, send /sessions again")
+                return
+            alias = str(managed[target]["alias"])
+            ref = f"alias:{alias}"
+            self.db.set_selected_session(chat_id, ref)
+            self.api.answer_callback_query(cb_id, f"Selected: {alias}")
+            self._send_main_menu(chat_id, f"Selected: {ref}\n{self._format_selected_status(chat_id)}")
+            return
+
+        self.api.answer_callback_query(cb_id, "Unsupported callback")
 
     def _flush_notifications(self, limit: int) -> None:
         for _ in range(limit):
@@ -1606,6 +1761,10 @@ class TelegramService(threading.Thread):
             self._handle_approve_plan_callback(cb_id, chat_id, pending_id, callback_token)
             return
 
+        if parts and parts[0] == "sl":
+            self._handle_sessions_callback(cb_id, chat_id, parts)
+            return
+
         if len(parts) != 5 or parts[0] != "pick":
             self.api.answer_callback_query(cb_id, "Unsupported callback")
             return
@@ -1755,31 +1914,34 @@ class TelegramService(threading.Thread):
         chat = message.get("chat", {}) if isinstance(message.get("chat"), dict) else {}
         from_user = message.get("from", {}) if isinstance(message.get("from"), dict) else {}
         chat_id = int(chat.get("id", 0))
-        text = str(message.get("text", "")).strip()
+        raw_text = str(message.get("text", "")).strip()
         username = str(from_user.get("username") or from_user.get("first_name") or "unknown")
 
-        if not text:
+        if not raw_text:
             return
 
+        text = self._normalize_message_text(raw_text)
         cmd, arg = self._split_command(text)
 
         if cmd == "/start":
-            self._reply(chat_id, "Use /bind <binding_id> to bind this chat.")
+            self._send_main_menu(chat_id, "Use /bind <binding_id> to bind this chat.")
             return
 
         if cmd == "/help":
-            self._reply(
+            self._send_main_menu(
                 chat_id,
                 "Commands:\n"
                 "/bind <binding_id>\n"
                 "/unbind\n"
+                "/menu\n"
                 "/sessions\n"
                 "/select <alias|session_id>\n"
                 "/status\n"
                 "/send <text>\n"
                 "/mode <plan|default>\n"
                 "/approve\n"
-                "/reject\n",
+                "/reject\n\n"
+                "Tip: plain text (without leading /) is sent to the selected managed session.",
             )
             return
 
@@ -1796,7 +1958,7 @@ class TelegramService(threading.Thread):
                 self._reply(chat_id, f"Bind failed: {msg}")
                 return
             self.db.bind_chat(chat_id, username)
-            self._reply(chat_id, "Bind success.")
+            self._send_main_menu(chat_id, "Bind success. Use buttons or commands to control sessions.")
             return
 
         if cmd == "/unbind":
@@ -1804,17 +1966,26 @@ class TelegramService(threading.Thread):
             self._reply(chat_id, "Unbound.")
             return
 
+        if cmd == "/menu":
+            if not self.db.is_chat_bound(chat_id):
+                self._reply(chat_id, "Not bound. Use /bind <binding_id>.")
+                return
+            self._send_main_menu(chat_id, "Main menu ready.")
+            return
+
         if not self.db.is_chat_bound(chat_id):
             self._reply(chat_id, "Not bound. Use /bind <binding_id>.")
             return
 
         if cmd == "/sessions":
-            self._reply(chat_id, self._format_sessions())
+            text_page, keyboard, _ = self._render_sessions_page(chat_id, page=0)
+            self._reply(chat_id, text_page, reply_markup=keyboard)
             return
 
         if cmd == "/select":
             if not arg:
-                self._reply(chat_id, "Usage: /select <alias|session_id>")
+                text_page, keyboard, _ = self._render_sessions_page(chat_id, page=0)
+                self._reply(chat_id, text_page, reply_markup=keyboard)
                 return
             ref = self._resolve_session_ref(arg)
             if not ref:
@@ -1834,7 +2005,7 @@ class TelegramService(threading.Thread):
                 return
             session_id = self._selected_session_id(chat_id)
             if not session_id:
-                self._reply(chat_id, "No selected managed session. Use /select.")
+                self._reply(chat_id, "No selected managed session. Use /sessions.")
                 return
             ok, msg = self._send_to_session(session_id, arg)
             self._reply(chat_id, "Sent." if ok else f"Send failed: {msg}")
@@ -1850,7 +2021,7 @@ class TelegramService(threading.Thread):
                 return
             session_id = self._selected_session_id(chat_id)
             if not session_id:
-                self._reply(chat_id, "No selected managed session.")
+                self._reply(chat_id, "No selected managed session. Use /sessions.")
                 return
             ok, msg = self._send_to_session(session_id, text_to_send)
             self._reply(chat_id, "Mode command sent." if ok else f"Failed: {msg}")
@@ -1859,13 +2030,22 @@ class TelegramService(threading.Thread):
         if cmd in ("/approve", "/reject"):
             session_id = self._selected_session_id(chat_id)
             if not session_id:
-                self._reply(chat_id, "No selected managed session.")
+                self._reply(chat_id, "No selected managed session. Use /sessions.")
                 return
             ok, msg = self._handle_approval_action(session_id, approve=(cmd == "/approve"))
             self._reply(chat_id, "Done." if ok else f"Failed: {msg}")
             return
 
-        self._reply(chat_id, "Unknown command. Use /help.")
+        if text.startswith("/"):
+            self._reply(chat_id, "Unknown command. Use /help.")
+            return
+
+        session_id = self._selected_session_id(chat_id)
+        if not session_id:
+            self._reply(chat_id, "No selected managed session. Use /sessions.")
+            return
+        ok, msg = self._send_to_session(session_id, text)
+        self._reply(chat_id, "Sent." if ok else f"Send failed: {msg}")
 
     def _handle_approval_action(self, session_id: str, approve: bool) -> Tuple[bool, str]:
         pendings = self.db.get_pending_for_session(session_id)
@@ -1975,8 +2155,8 @@ class TelegramService(threading.Thread):
             return normalized[1][0]
         return normalized[0][0]
 
-    def _reply(self, chat_id: int, text: str) -> None:
-        self.api.send_message(chat_id, text)
+    def _reply(self, chat_id: int, text: str, reply_markup: Optional[Dict[str, Any]] = None) -> None:
+        self.api.send_message(chat_id, text, reply_markup=reply_markup)
 
     def _resolve_session_ref(self, value: str) -> Optional[str]:
         m = self.db.get_managed_by_alias(value)
@@ -2047,7 +2227,7 @@ class TelegramService(threading.Thread):
     def _format_selected_status(self, chat_id: int) -> str:
         ref = self.db.get_selected_session(chat_id)
         if not ref:
-            return "No selected session. Use /sessions then /select."
+            return "No selected session. Use /sessions."
 
         session_id = self._selected_session_id(chat_id)
         lines = [f"selected: {ref}"]
