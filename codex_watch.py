@@ -109,17 +109,23 @@ def load_config(path: str) -> Config:
     sessions_root = os.path.expanduser(str(deep_get(raw, ["monitor", "sessions_root"], DEFAULT_SESSIONS_ROOT)))
     scan_interval_sec = int(deep_get(raw, ["monitor", "scan_interval_sec"], 2))
     backfill_lines = int(deep_get(raw, ["monitor", "backfill_lines"], 3000))
-    enabled_triggers = list(deep_get(raw, ["notify", "enabled_triggers"], [
-        "task_complete",
-        "request_user_input",
-        "proposed_plan_ready",
-    ]))
+    enabled_triggers = list(
+        deep_get(
+            raw,
+            ["notify", "enabled_triggers"],
+            [
+                "task_complete",
+                "request_user_input",
+                "proposed_plan_ready",
+            ],
+        )
+    )
     sqlite_path = os.path.expanduser(str(deep_get(raw, ["runtime", "sqlite_path"], DEFAULT_SQLITE_PATH)))
     log_path = os.path.expanduser(str(deep_get(raw, ["runtime", "log_path"], DEFAULT_LOG_PATH)))
     pid_path = os.path.expanduser(str(deep_get(raw, ["runtime", "pid_path"], DEFAULT_PID_PATH)))
 
-    mode_plan_template = str(deep_get(raw, ["commands", "mode_plan_template"], "Please switch to Plan mode for the next response."))
-    mode_default_template = str(deep_get(raw, ["commands", "mode_default_template"], "Switch back to Default mode now."))
+    mode_plan_template = str(deep_get(raw, ["commands", "mode_plan_template"], "/plan"))
+    mode_default_template = str(deep_get(raw, ["commands", "mode_default_template"], "/default"))
     approve_plan_template = str(deep_get(raw, ["commands", "approve_plan_template"], "Implement the plan."))
     reject_plan_template = str(deep_get(raw, ["commands", "reject_plan_template"], "Revise the plan with more detail, then resend it."))
 
@@ -230,6 +236,8 @@ class DB:
                     kind TEXT NOT NULL,
                     payload_json TEXT NOT NULL,
                     payload_hash TEXT NOT NULL DEFAULT '',
+                    question_index INTEGER NOT NULL DEFAULT 0,
+                    answers_json TEXT NOT NULL DEFAULT '[]',
                     status TEXT NOT NULL DEFAULT 'pending',
                     created_at INTEGER NOT NULL,
                     responded_at INTEGER
@@ -273,6 +281,12 @@ class DB:
         pending_cols = {str(r[1]) for r in cur.fetchall()}
         if "payload_hash" not in pending_cols:
             cur.execute("ALTER TABLE pending_inputs ADD COLUMN payload_hash TEXT NOT NULL DEFAULT ''")
+        if "question_index" not in pending_cols:
+            cur.execute("ALTER TABLE pending_inputs ADD COLUMN question_index INTEGER NOT NULL DEFAULT 0")
+        if "answers_json" not in pending_cols:
+            cur.execute("ALTER TABLE pending_inputs ADD COLUMN answers_json TEXT NOT NULL DEFAULT '[]'")
+        cur.execute("UPDATE pending_inputs SET question_index=0 WHERE question_index IS NULL")
+        cur.execute("UPDATE pending_inputs SET answers_json='[]' WHERE answers_json IS NULL OR answers_json=''")
         cur.execute("SELECT id, payload_json FROM pending_inputs WHERE payload_hash='' OR payload_hash IS NULL")
         rows = cur.fetchall()
         for row in rows:
@@ -628,13 +642,86 @@ class DB:
         with self.lock:
             cur = self.conn.execute(
                 """
-                INSERT INTO pending_inputs(session_id, turn_id, kind, payload_json, payload_hash, status, created_at)
-                VALUES(?, ?, ?, ?, ?, 'pending', ?)
+                INSERT INTO pending_inputs(session_id, turn_id, kind, payload_json, payload_hash, question_index, answers_json, status, created_at)
+                VALUES(?, ?, ?, ?, ?, 0, '[]', 'pending', ?)
                 """,
                 (session_id, turn_id, kind, payload_json, payload_hash, utc_ts()),
             )
             self.conn.commit()
             return int(cur.lastrowid), payload_hash
+
+    def advance_pending_request_user_input(
+        self,
+        pending_id: int,
+        expected_question_index: int,
+        answer_entry: Dict[str, Any],
+        total_questions: int,
+    ) -> Tuple[bool, bool, int, str]:
+        now = utc_ts()
+        with self.lock:
+            cur = self.conn.execute(
+                "SELECT status, question_index, answers_json FROM pending_inputs WHERE id=?",
+                (pending_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return False, False, expected_question_index, "pending not found"
+            if str(row["status"]) != "pending":
+                return False, False, expected_question_index, "already handled"
+            current_idx = int(row["question_index"] if row["question_index"] is not None else 0)
+            if current_idx != expected_question_index:
+                return False, False, current_idx, "stale question"
+
+            answers_raw = str(row["answers_json"] or "[]")
+            try:
+                answers = json.loads(answers_raw)
+                if not isinstance(answers, list):
+                    answers = []
+            except json.JSONDecodeError:
+                answers = []
+            answers.append(answer_entry)
+            answers_json = json.dumps(answers, ensure_ascii=True, sort_keys=True)
+
+            next_idx = expected_question_index + 1
+            if next_idx >= total_questions:
+                cur2 = self.conn.execute(
+                    """
+                    UPDATE pending_inputs
+                    SET question_index=?, answers_json=?, status='responded', responded_at=?
+                    WHERE id=? AND status='pending' AND question_index=?
+                    """,
+                    (next_idx, answers_json, now, pending_id, expected_question_index),
+                )
+                self.conn.commit()
+                if cur2.rowcount <= 0:
+                    return False, False, expected_question_index, "stale question"
+                return True, True, next_idx, "ok"
+
+            cur2 = self.conn.execute(
+                """
+                UPDATE pending_inputs
+                SET question_index=?, answers_json=?
+                WHERE id=? AND status='pending' AND question_index=?
+                """,
+                (next_idx, answers_json, pending_id, expected_question_index),
+            )
+            self.conn.commit()
+            if cur2.rowcount <= 0:
+                return False, False, expected_question_index, "stale question"
+            return True, False, next_idx, "ok"
+
+    def mark_pending_responded_with_answers(self, pending_id: int, answers: List[Dict[str, Any]], final_question_index: int) -> None:
+        with self.lock:
+            answers_json = json.dumps(answers, ensure_ascii=True, sort_keys=True)
+            self.conn.execute(
+                """
+                UPDATE pending_inputs
+                SET status='responded', responded_at=?, answers_json=?, question_index=?
+                WHERE id=?
+                """,
+                (utc_ts(), answers_json, final_question_index, pending_id),
+            )
+            self.conn.commit()
 
     def mark_managed_awaiting_manual_attach_for_nonces(self, nonces: List[str]) -> int:
         uniq = sorted({str(v).strip() for v in nonces if str(v).strip()})
@@ -750,6 +837,7 @@ class TmuxController:
 class SessionState:
     current_turn_id: Optional[str] = None
     proposed_plan_turns: set = dataclasses.field(default_factory=set)
+    assistant_text_by_turn: Dict[str, str] = dataclasses.field(default_factory=dict)
 
 
 class NotificationBus:
@@ -1014,6 +1102,13 @@ class SessionMonitor(threading.Thread):
         if self.db.add_dedup(dedup_key):
             self.bus.publish(event)
 
+    def _summarize_assistant_text(self, text: str, max_chars: int = 800) -> str:
+        compact = re.sub(r"\s+", " ", text).strip()
+        compact = compact.replace("<proposed_plan>", "").replace("</proposed_plan>", "").strip()
+        if len(compact) <= max_chars:
+            return compact
+        return compact[: max_chars - 1].rstrip() + "..."
+
     def _handle_line(self, file_path: str, line: str, mode: str = "live") -> None:
         text = line.strip()
         if not text:
@@ -1049,13 +1144,17 @@ class SessionMonitor(threading.Thread):
 
                 if mode == "live" and "task_complete" in self.cfg.enabled_triggers:
                     dedup = f"{session_key}:{turn}:task_complete"
+                    assistant_text = state.assistant_text_by_turn.get(turn)
+                    event: Dict[str, Any] = {
+                        "type": "task_complete",
+                        "session_id": session_key,
+                        "turn_id": turn,
+                    }
+                    if assistant_text:
+                        event["assistant_text"] = self._summarize_assistant_text(assistant_text)
                     self._emit_once(
                         dedup,
-                        {
-                            "type": "task_complete",
-                            "session_id": session_key,
-                            "turn_id": turn,
-                        },
+                        event,
                     )
 
                 if "proposed_plan_ready" in self.cfg.enabled_triggers and turn in state.proposed_plan_turns:
@@ -1067,15 +1166,17 @@ class SessionMonitor(threading.Thread):
                             kind="proposed_plan",
                             payload={"turn_id": turn},
                         )
-                        self.bus.publish(
-                            {
-                                "type": "proposed_plan_ready",
-                                "session_id": session_key,
-                                "turn_id": turn,
-                                "pending_id": pending_id,
-                                "payload_hash": payload_hash,
-                            }
-                        )
+                        event = {
+                            "type": "proposed_plan_ready",
+                            "session_id": session_key,
+                            "turn_id": turn,
+                            "pending_id": pending_id,
+                            "payload_hash": payload_hash,
+                        }
+                        assistant_text = state.assistant_text_by_turn.get(turn)
+                        if assistant_text:
+                            event["assistant_text"] = self._summarize_assistant_text(assistant_text)
+                        self.bus.publish(event)
                     state.proposed_plan_turns.discard(turn)
                 return
 
@@ -1119,15 +1220,25 @@ class SessionMonitor(threading.Thread):
                 if not isinstance(content, list):
                     return
                 found = False
+                texts: List[str] = []
                 for item in content:
                     if not isinstance(item, dict):
                         continue
                     itype = item.get("type")
                     if itype in ("output_text", "text"):
                         body = item.get("text", "")
-                        if isinstance(body, str) and "<proposed_plan>" in body:
-                            found = True
-                            break
+                        if isinstance(body, str):
+                            cleaned = body.strip()
+                            if cleaned:
+                                texts.append(cleaned)
+                            if "<proposed_plan>" in body:
+                                found = True
+                if texts:
+                    turn = state.current_turn_id or "unknown"
+                    state.assistant_text_by_turn[turn] = "\n\n".join(texts)
+                    if len(state.assistant_text_by_turn) > 80:
+                        oldest = next(iter(state.assistant_text_by_turn))
+                        del state.assistant_text_by_turn[oldest]
                 if found:
                     turn = state.current_turn_id or "unknown"
                     state.proposed_plan_turns.add(turn)
@@ -1215,41 +1326,39 @@ class TelegramService(threading.Thread):
 
         if etype == "task_complete":
             text = f"[Codex] task complete\nsession: {session_label}\nturn: {event.get('turn_id', 'unknown')}"
+            assistant_text = str(event.get("assistant_text") or "").strip()
+            if assistant_text:
+                text += f"\n\nassistant:\n{assistant_text}"
         elif etype == "proposed_plan_ready":
             text = (
                 f"[Codex] plan ready for execution\n"
                 f"session: {session_label}\n"
                 f"turn: {event.get('turn_id', 'unknown')}\n"
-                f"Use /select then /approve to execute."
+                f"Tap Approve Plan to auto-select this session and execute."
             )
+            assistant_text = str(event.get("assistant_text") or "").strip()
+            if assistant_text:
+                text += f"\n\nassistant:\n{assistant_text}"
+            try:
+                pending_id = int(event.get("pending_id"))
+            except (TypeError, ValueError):
+                pending_id = 0
+            payload_hash = str(event.get("payload_hash") or "")
+            callback_token = self._build_pending_callback_token(pending_id, payload_hash)
+            if pending_id > 0 and callback_token:
+                cb = f"appr|{pending_id}|{callback_token}"
+                keyboard = {"inline_keyboard": [[{"text": "Approve Plan", "callback_data": cb[:64]}]]}
         elif etype == "request_user_input":
-            args = event.get("arguments", {})
-            questions = args.get("questions", []) if isinstance(args, dict) else []
-            lines = [f"[Codex] request_user_input", f"session: {session_label}"]
-            buttons: List[List[Dict[str, str]]] = []
-            if questions and isinstance(questions[0], dict):
-                q = questions[0]
-                prompt = str(q.get("question", ""))
-                lines.append(f"question: {prompt}")
-                options = q.get("options", []) if isinstance(q.get("options"), list) else []
-                pending_id_raw = event.get("pending_id")
-                payload_hash = str(event.get("payload_hash") or "")
-                callback_token = ""
-                try:
-                    pending_id_int = int(pending_id_raw)
-                    callback_token = self._build_pending_callback_token(pending_id_int, payload_hash)
-                except (TypeError, ValueError):
-                    callback_token = ""
-                for idx, option in enumerate(options[:6]):
-                    if isinstance(option, dict):
-                        label = str(option.get("label", f"option-{idx+1}"))
-                        lines.append(f"{idx+1}. {label}")
-                        if callback_token:
-                            cb = f"pick|{pending_id_int}|{idx}|{callback_token}"
-                            buttons.append([{"text": label[:64], "callback_data": cb[:64]}])
-            text = "\n".join(lines)
-            if buttons:
-                keyboard = {"inline_keyboard": buttons}
+            pending: Optional[sqlite3.Row] = None
+            try:
+                pending_id = int(event.get("pending_id"))
+                pending = self.db.get_pending_by_id(pending_id)
+            except (TypeError, ValueError):
+                pending = None
+            if pending and str(pending["status"]) == "pending" and str(pending["kind"]) == "request_user_input":
+                text, keyboard = self._render_pending_question_message(session_label, pending)
+            else:
+                text = f"[Codex] request_user_input\nsession: {session_label}\n(pending payload unavailable)"
         else:
             text = f"[Codex] event: {etype}\n{json.dumps(event, ensure_ascii=True)}"
 
@@ -1258,6 +1367,60 @@ class TelegramService(threading.Thread):
                 self.api.send_message(chat_id, text, reply_markup=keyboard)
             except Exception:
                 logging.exception("failed to send telegram event")
+
+    def _render_pending_question_message(
+        self,
+        session_label: str,
+        pending: sqlite3.Row,
+    ) -> Tuple[str, Optional[Dict[str, Any]]]:
+        pending_id = int(pending["id"])
+        payload_hash = str(pending["payload_hash"] or "")
+        lines = [f"[Codex] request_user_input", f"session: {session_label}"]
+        keyboard: Optional[Dict[str, Any]] = None
+        try:
+            payload = json.loads(str(pending["payload_json"]))
+        except json.JSONDecodeError:
+            lines.append("error: invalid pending payload")
+            return "\n".join(lines), None
+        args = payload.get("arguments", {}) if isinstance(payload, dict) else {}
+        questions = args.get("questions", []) if isinstance(args, dict) else []
+        if not isinstance(questions, list) or not questions:
+            lines.append("error: no questions found")
+            return "\n".join(lines), None
+
+        question_index = int(pending["question_index"] if pending["question_index"] is not None else 0)
+        if question_index < 0 or question_index >= len(questions):
+            lines.append("error: question index out of range")
+            return "\n".join(lines), None
+
+        question = questions[question_index]
+        if not isinstance(question, dict):
+            lines.append("error: invalid question payload")
+            return "\n".join(lines), None
+
+        lines.append(f"question {question_index + 1}/{len(questions)}")
+        prompt = str(question.get("question", "")).strip()
+        if prompt:
+            lines.append(f"prompt: {prompt}")
+
+        options = question.get("options", [])
+        if not isinstance(options, list) or not options:
+            lines.append("error: no options found")
+            return "\n".join(lines), None
+
+        callback_token = self._build_pending_callback_token(pending_id, payload_hash)
+        buttons: List[List[Dict[str, str]]] = []
+        for idx, option in enumerate(options[:6]):
+            if not isinstance(option, dict):
+                continue
+            label = str(option.get("label", f"option-{idx + 1}"))
+            lines.append(f"{idx + 1}. {label}")
+            if callback_token:
+                cb = f"pick|{pending_id}|{question_index}|{idx}|{callback_token}"
+                buttons.append([{"text": label[:64], "callback_data": cb[:64]}])
+        if buttons:
+            keyboard = {"inline_keyboard": buttons}
+        return "\n".join(lines), keyboard
 
     def _handle_update(self, update: Dict[str, Any]) -> None:
         if "message" in update:
@@ -1277,14 +1440,28 @@ class TelegramService(threading.Thread):
             return
 
         parts = data.split("|")
-        if len(parts) != 4 or parts[0] != "pick":
+        if parts and parts[0] == "appr":
+            if len(parts) != 3:
+                self.api.answer_callback_query(cb_id, "Invalid callback data")
+                return
+            try:
+                pending_id = int(parts[1])
+            except ValueError:
+                self.api.answer_callback_query(cb_id, "Invalid callback data")
+                return
+            callback_token = str(parts[2]).strip().lower()
+            self._handle_approve_plan_callback(cb_id, chat_id, pending_id, callback_token)
+            return
+
+        if len(parts) != 5 or parts[0] != "pick":
             self.api.answer_callback_query(cb_id, "Unsupported callback")
             return
 
         try:
             pending_id = int(parts[1])
-            idx = int(parts[2])
-            callback_token = str(parts[3]).strip().lower()
+            question_idx = int(parts[2])
+            idx = int(parts[3])
+            callback_token = str(parts[4]).strip().lower()
         except ValueError:
             self.api.answer_callback_query(cb_id, "Invalid callback data")
             return
@@ -1310,11 +1487,22 @@ class TelegramService(threading.Thread):
             return
         args = payload.get("arguments", {})
         questions = args.get("questions", []) if isinstance(args, dict) else []
-        if not questions or not isinstance(questions[0], dict):
+        if not questions or not isinstance(questions, list):
             self.api.answer_callback_query(cb_id, "No options found")
             return
+        current_qidx = int(pending["question_index"] if pending["question_index"] is not None else 0)
+        if question_idx != current_qidx:
+            self.api.answer_callback_query(cb_id, "Stale options, refresh from latest prompt")
+            return
+        if question_idx < 0 or question_idx >= len(questions):
+            self.api.answer_callback_query(cb_id, "Question out of range")
+            return
+        question = questions[question_idx]
+        if not isinstance(question, dict):
+            self.api.answer_callback_query(cb_id, "Invalid question")
+            return
 
-        options = questions[0].get("options", [])
+        options = question.get("options", [])
         if not isinstance(options, list) or idx < 0 or idx >= len(options):
             self.api.answer_callback_query(cb_id, "Option out of range")
             return
@@ -1327,11 +1515,82 @@ class TelegramService(threading.Thread):
         label = str(option.get("label", ""))
         label_send = self._clean_option_label(label)
         ok, msg = self._send_to_session(session_id, label_send)
+        if not ok:
+            self.api.answer_callback_query(cb_id, f"Failed: {msg[:80]}")
+            return
+
+        answer_entry = {
+            "question_index": question_idx,
+            "option_index": idx,
+            "label": label,
+            "sent_text": label_send,
+            "answered_at": utc_ts(),
+        }
+        progressed, done, next_idx, progress_msg = self.db.advance_pending_request_user_input(
+            pending_id,
+            question_idx,
+            answer_entry,
+            len(questions),
+        )
+        if not progressed:
+            if progress_msg == "stale question":
+                self.api.answer_callback_query(cb_id, "Stale options, refresh from latest prompt")
+            elif progress_msg == "already handled":
+                self.api.answer_callback_query(cb_id, "Already handled")
+            else:
+                self.api.answer_callback_query(cb_id, "State update failed")
+            return
+
+        self.api.answer_callback_query(cb_id, "Sent")
+        if done:
+            return
+
+        pending_next = self.db.get_pending_by_id(pending_id)
+        if not pending_next or str(pending_next["status"]) != "pending":
+            return
+        managed = self.db.get_managed_by_session_id(session_id)
+        session_label = f"{managed['alias']} ({session_id})" if managed else session_id
+        text_next, keyboard_next = self._render_pending_question_message(session_label, pending_next)
+        try:
+            self.api.send_message(chat_id, text_next, reply_markup=keyboard_next)
+        except Exception:
+            logging.exception("failed to send next request_user_input question pending_id=%s next_idx=%s", pending_id, next_idx)
+
+    def _handle_approve_plan_callback(self, cb_id: str, chat_id: int, pending_id: int, callback_token: str) -> None:
+        pending = self.db.get_pending_by_id(pending_id)
+        if not pending or str(pending["status"]) != "pending":
+            self.api.answer_callback_query(cb_id, "Already handled")
+            return
+        if str(pending["kind"]) != "proposed_plan":
+            self.api.answer_callback_query(cb_id, "Not a plan action")
+            return
+
+        payload_hash = str(pending["payload_hash"] or "")
+        if not payload_hash:
+            self.api.answer_callback_query(cb_id, "Stale action")
+            return
+        expected_token = self._build_pending_callback_token(pending_id, payload_hash)
+        if callback_token != expected_token:
+            self.api.answer_callback_query(cb_id, "Stale action")
+            return
+
+        session_id = str(pending["session_id"] or "")
+        if not session_id:
+            self.api.answer_callback_query(cb_id, "Missing session id")
+            return
+
+        managed = self.db.get_managed_by_session_id(session_id)
+        if managed:
+            self.db.set_selected_session(chat_id, f"alias:{managed['alias']}")
+        else:
+            self.db.set_selected_session(chat_id, f"session:{session_id}")
+
+        ok, msg = self._send_to_session(session_id, self.cfg.approve_plan_template)
         if ok:
             self.db.mark_pending_responded(pending_id)
-            self.api.answer_callback_query(cb_id, "Sent")
-        else:
-            self.api.answer_callback_query(cb_id, f"Failed: {msg[:80]}")
+            self.api.answer_callback_query(cb_id, "Approved")
+            return
+        self.api.answer_callback_query(cb_id, f"Failed: {msg[:80]}")
 
     def _build_pending_callback_token(self, pending_id: int, payload_hash: str) -> str:
         if pending_id <= 0 or not payload_hash:
@@ -1468,22 +1727,53 @@ class TelegramService(threading.Thread):
             if kind == "request_user_input":
                 args = payload.get("arguments", {})
                 questions = args.get("questions", []) if isinstance(args, dict) else []
-                if not questions or not isinstance(questions[0], dict):
+                if not isinstance(questions, list) or not questions:
                     return False, "invalid pending question"
-                options = questions[0].get("options", [])
-                if not isinstance(options, list) or not options:
-                    return False, "no options"
-
-                idx = self._pick_option_index(options, approve=approve)
-                option = options[idx]
-                if not isinstance(option, dict):
-                    return False, "invalid option"
-                label = str(option.get("label", ""))
-                send_text = self._clean_option_label(label)
-                ok, msg = self._send_to_session(session_id, send_text)
-                if ok:
+                start_idx = int(first["question_index"] if first["question_index"] is not None else 0)
+                if start_idx < 0:
+                    start_idx = 0
+                if start_idx >= len(questions):
                     self.db.mark_pending_responded(int(first["id"]))
-                return ok, msg
+                    return True, "already completed"
+
+                answers_raw = str(first["answers_json"] or "[]")
+                try:
+                    answers = json.loads(answers_raw)
+                    if not isinstance(answers, list):
+                        answers = []
+                except json.JSONDecodeError:
+                    answers = []
+
+                for qidx in range(start_idx, len(questions)):
+                    question = questions[qidx]
+                    if not isinstance(question, dict):
+                        return False, "invalid question payload"
+                    options = question.get("options", [])
+                    if not isinstance(options, list) or not options:
+                        return False, "no options"
+
+                    pick_idx = self._pick_option_index(options, approve=approve)
+                    option = options[pick_idx]
+                    if not isinstance(option, dict):
+                        return False, "invalid option"
+                    label = str(option.get("label", ""))
+                    send_text = self._clean_option_label(label)
+                    ok, msg = self._send_to_session(session_id, send_text)
+                    if not ok:
+                        return False, msg
+                    answers.append(
+                        {
+                            "question_index": qidx,
+                            "option_index": pick_idx,
+                            "label": label,
+                            "sent_text": send_text,
+                            "answered_at": utc_ts(),
+                            "source": "approve" if approve else "reject",
+                        }
+                    )
+
+                self.db.mark_pending_responded_with_answers(int(first["id"]), answers, len(questions))
+                return True, "ok"
 
             if kind == "proposed_plan":
                 send_text = self.cfg.approve_plan_template if approve else self.cfg.reject_plan_template
@@ -1632,7 +1922,7 @@ class TelegramService(threading.Thread):
                 lines.append(f"managed alias: {alias}")
                 lines.append(f"codex_session_id: {row['codex_session_id'] or '(waiting for session id)'}")
                 lines.append(f"status: {row['status']}")
-                pendings = self.db.get_pending_for_session(str(row['codex_session_id'])) if row['codex_session_id'] else []
+                pendings = self.db.get_pending_for_session(str(row["codex_session_id"])) if row["codex_session_id"] else []
                 lines.append(f"pending items: {len(pendings)}")
                 return "\n".join(lines)
             lines.append("managed alias not found")
