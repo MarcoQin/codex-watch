@@ -6,6 +6,7 @@ import os
 import re
 import sqlite3
 import threading
+import collections
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -264,6 +265,28 @@ class SessionMonitor(threading.Thread):
         sid = self.db.resolve_session_id_for_path(file_path)
         return sid if sid else file_path
 
+    @staticmethod
+    def _resolve_turn_id(payload: Dict[str, Any], fallback: Optional[str]) -> str:
+        turn_id = payload.get("turn_id")
+        if isinstance(turn_id, str) and turn_id:
+            return turn_id
+        return fallback or "unknown"
+
+    @staticmethod
+    def _clean_text(value: Any) -> str:
+        if not isinstance(value, str):
+            return ""
+        return value.strip()
+
+    def _remember_assistant_text(self, state: SessionState, turn_id: str, text: str) -> None:
+        cleaned = self._clean_text(text)
+        if not cleaned:
+            return
+        state.assistant_text_by_turn[turn_id] = cleaned
+        if len(state.assistant_text_by_turn) > 80:
+            oldest = next(iter(state.assistant_text_by_turn))
+            del state.assistant_text_by_turn[oldest]
+
     def _emit_once(self, dedup_key: str, event: Dict[str, Any]) -> None:
         if self.db.add_dedup(dedup_key):
             self.bus.publish(event)
@@ -340,14 +363,28 @@ class SessionMonitor(threading.Thread):
                     state.current_turn_id = turn
                 return
 
+            if ev_type == "item_completed":
+                turn = self._resolve_turn_id(payload, state.current_turn_id)
+                item = payload.get("item", {}) if isinstance(payload.get("item"), dict) else {}
+                item_type = self._clean_text(item.get("type")).lower()
+                item_text = self._clean_text(item.get("text"))
+                if item_type in ("plan", "message") and item_text:
+                    self._remember_assistant_text(state, turn, item_text)
+                if item_type == "plan":
+                    state.proposed_plan_turns.add(turn)
+                return
+
             if ev_type == "task_complete":
-                turn = payload.get("turn_id")
-                if not isinstance(turn, str) or not turn:
-                    turn = state.current_turn_id or "unknown"
+                turn = self._resolve_turn_id(payload, state.current_turn_id)
 
                 if mode == "live" and "task_complete" in self.cfg.enabled_triggers:
                     dedup = f"{session_key}:{turn}:task_complete"
-                    assistant_text = state.assistant_text_by_turn.get(turn)
+                    assistant_text = self._clean_text(state.assistant_text_by_turn.get(turn))
+                    source = "state"
+                    if not assistant_text:
+                        assistant_text = self._clean_text(payload.get("last_agent_message"))
+                        source = "last_agent_message" if assistant_text else "none"
+                    logging.debug("task_complete notify text source session=%s turn=%s source=%s", session_key, turn, source)
                     event: Dict[str, Any] = {
                         "type": "task_complete",
                         "session_id": session_key,
@@ -447,12 +484,9 @@ class SessionMonitor(threading.Thread):
                             if "<proposed_plan>" in body:
                                 found = True
                 if texts:
-                    turn = state.current_turn_id or "unknown"
-                    state.assistant_text_by_turn[turn] = "\n\n".join(texts)
-                    if len(state.assistant_text_by_turn) > 80:
-                        oldest = next(iter(state.assistant_text_by_turn))
-                        del state.assistant_text_by_turn[oldest]
+                    turn = self._resolve_turn_id(payload, state.current_turn_id)
+                    self._remember_assistant_text(state, turn, "\n\n".join(texts))
                 if found:
-                    turn = state.current_turn_id or "unknown"
+                    turn = self._resolve_turn_id(payload, state.current_turn_id)
                     state.proposed_plan_turns.add(turn)
                 return
