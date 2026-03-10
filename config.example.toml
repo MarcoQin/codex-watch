@@ -1,0 +1,25 @@
+[telegram]
+bot_token = ""
+poll_interval_sec = 2
+
+[auth]
+binding_id_ttl_sec = 600
+
+[monitor]
+sessions_root = "~/.codex/sessions"
+scan_interval_sec = 2
+backfill_lines = 3000
+
+[notify]
+enabled_triggers = ["task_complete", "request_user_input", "proposed_plan_ready"]
+
+[runtime]
+sqlite_path = "~/.local/state/codex-watch/state.sqlite3"
+log_path = "~/.local/state/codex-watch/codex-watch.log"
+pid_path = "~/.local/state/codex-watch/codex-watch.pid"
+
+[commands]
+mode_plan_template = "Please switch to Plan mode for the next response."
+mode_default_template = "Switch back to Default mode now."
+approve_plan_template = "Implement the plan."
+reject_plan_template = "Revise the plan with more detail, then resend it."
