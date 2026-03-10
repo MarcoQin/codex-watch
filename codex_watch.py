@@ -3,6 +3,7 @@ import argparse
 import collections
 import dataclasses
 import datetime as dt
+import html
 import hashlib
 import json
 import logging
@@ -849,10 +850,21 @@ class TelegramAPI:
         res = self._call("getUpdates", payload, request_timeout_sec=timeout_budget)
         return list(res.get("result", []))
 
-    def send_message(self, chat_id: int, text: str, reply_markup: Optional[Dict[str, Any]] = None) -> None:
+    def send_message(
+        self,
+        chat_id: int,
+        text: str,
+        reply_markup: Optional[Dict[str, Any]] = None,
+        parse_mode: Optional[str] = None,
+        disable_web_page_preview: Optional[bool] = None,
+    ) -> None:
         payload: Dict[str, Any] = {"chat_id": chat_id, "text": text}
         if reply_markup is not None:
             payload["reply_markup"] = reply_markup
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
+        if disable_web_page_preview is not None:
+            payload["disable_web_page_preview"] = disable_web_page_preview
         self._call("sendMessage", payload)
 
     def answer_callback_query(self, callback_query_id: str, text: str = "") -> None:
@@ -1354,6 +1366,9 @@ class SessionMonitor(threading.Thread):
 
 class TelegramService(threading.Thread):
     SESSIONS_PAGE_SIZE = 6
+    TELEGRAM_TEXT_LIMIT = 4096
+    TELEGRAM_CHUNK_SOFT_LIMIT = 3800
+    SUPPORTED_HTML_TAGS = ("b", "i", "u", "code")
 
     def __init__(self, cfg: Config, db: DB, bus: NotificationBus, stop_event: threading.Event):
         super().__init__(daemon=True)
@@ -1480,8 +1495,8 @@ class TelegramService(threading.Thread):
             "one_time_keyboard": False,
         }
 
-    def _send_main_menu(self, chat_id: int, text: str) -> None:
-        self._reply(chat_id, text, reply_markup=self._main_menu_keyboard())
+    def _send_main_menu(self, chat_id: int, text: str, rich: bool = False) -> None:
+        self._reply(chat_id, text, reply_markup=self._main_menu_keyboard(), rich=rich)
 
     def _normalize_message_text(self, text: str) -> str:
         mapping = {
@@ -1518,9 +1533,9 @@ class TelegramService(threading.Thread):
 
     def _render_sessions_page(self, chat_id: int, page: int) -> Tuple[str, Optional[Dict[str, Any]], int]:
         managed = self._managed_sessions_sorted()
-        lines = ["[Codex] managed sessions"]
+        lines = ["<b>[Codex] managed sessions</b>"]
         if not managed:
-            lines.append("- none")
+            lines.append("<i>- none</i>")
             return "\n".join(lines), None, 0
 
         total_pages = (len(managed) + self.SESSIONS_PAGE_SIZE - 1) // self.SESSIONS_PAGE_SIZE
@@ -1536,12 +1551,14 @@ class TelegramService(threading.Thread):
             sid = str(row["codex_session_id"] or "-")
             active = alias == selected_alias
             marker = "*" if active else " "
-            lines.append(f"{start + idx + 1}. {marker} {alias} | {status} | sid={sid}")
+            lines.append(
+                f"<b>{start + idx + 1}.</b> {self._h(marker)} {self._h(alias)} | {self._h(status)} | sid=<code>{self._h(sid)}</code>"
+            )
             button_text = f"{'[*] ' if active else ''}{alias} ({status})"
             callback = f"sl|s|{page}|{idx}"
             buttons.append([{"text": button_text[:64], "callback_data": callback[:64]}])
 
-        lines.append(f"page: {page + 1}/{total_pages}")
+        lines.append(self._kv_html("page", f"{page + 1}/{total_pages}"))
         nav: List[Dict[str, str]] = []
         if page > 0:
             nav.append({"text": "Prev", "callback_data": f"sl|p|{page - 1}"[:64]})
@@ -1567,7 +1584,7 @@ class TelegramService(threading.Thread):
                 self.api.answer_callback_query(cb_id, "Invalid callback data")
                 return
             text, keyboard, _ = self._render_sessions_page(chat_id, page)
-            self.api.send_message(chat_id, text, reply_markup=keyboard)
+            self._reply(chat_id, text, reply_markup=keyboard, rich=True)
             self.api.answer_callback_query(cb_id, "Updated")
             return
 
@@ -1593,7 +1610,12 @@ class TelegramService(threading.Thread):
             ref = f"alias:{alias}"
             self.db.set_selected_session(chat_id, ref)
             self.api.answer_callback_query(cb_id, f"Selected: {alias}")
-            self._send_main_menu(chat_id, f"Selected: {ref}\n{self._format_selected_status(chat_id)}")
+            self._reply(
+                chat_id,
+                f"<b>Selected:</b> <code>{self._h(ref)}</code>\n{self._format_selected_status_html(chat_id)}",
+                reply_markup=self._main_menu_keyboard(),
+                rich=True,
+            )
             return
 
         self.api.answer_callback_query(cb_id, "Unsupported callback")
@@ -1618,34 +1640,37 @@ class TelegramService(threading.Thread):
         text = ""
         continued_text = ""
         keyboard = None
+        rich = False
 
         if etype == "task_complete":
             lines = [
-                "[Codex] task complete",
-                f"session: {session_label}",
-                f"turn: {event.get('turn_id', 'unknown')}",
+                "<b>[Codex] task complete</b>",
+                self._kv_html("session", session_label),
+                self._kv_html("turn", event.get("turn_id", "unknown")),
             ]
             primary = str(event.get("assistant_text_primary") or event.get("assistant_text") or "").strip()
             continued_text = str(event.get("assistant_text_continued") or "").strip()
             if primary:
                 lines.append("")
-                lines.append("assistant summary:")
-                lines.append(primary)
+                lines.append("<b>assistant summary:</b>")
+                lines.append(self._h(primary))
             text = "\n".join(lines)
+            rich = True
         elif etype == "proposed_plan_ready":
             lines = [
-                "[Codex] plan ready for execution",
-                f"session: {session_label}",
-                f"turn: {event.get('turn_id', 'unknown')}",
-                "Tap Approve Plan to auto-select this session and execute.",
+                "<b>[Codex] plan ready for execution</b>",
+                self._kv_html("session", session_label),
+                self._kv_html("turn", event.get("turn_id", "unknown")),
+                "Tap <b>Approve Plan</b> to auto-select this session and execute.",
             ]
             primary = str(event.get("assistant_text_primary") or event.get("assistant_text") or "").strip()
             continued_text = str(event.get("assistant_text_continued") or "").strip()
             if primary:
                 lines.append("")
-                lines.append("assistant summary:")
-                lines.append(primary)
+                lines.append("<b>assistant summary:</b>")
+                lines.append(self._h(primary))
             text = "\n".join(lines)
+            rich = True
             try:
                 pending_id = int(event.get("pending_id"))
             except (TypeError, ValueError):
@@ -1665,15 +1690,24 @@ class TelegramService(threading.Thread):
             if pending and str(pending["status"]) == "pending" and str(pending["kind"]) == "request_user_input":
                 text, keyboard = self._render_pending_question_message(session_label, pending)
             else:
-                text = f"[Codex] request_user_input\nsession: {session_label}\n(pending payload unavailable)"
+                text = (
+                    "<b>[Codex] request_user_input</b>\n"
+                    f"{self._kv_html('session', session_label)}\n"
+                    "<i>(pending payload unavailable)</i>"
+                )
+            rich = True
         else:
             text = f"[Codex] event: {etype}\n{json.dumps(event, ensure_ascii=True)}"
 
         for chat_id in chats:
             try:
-                self.api.send_message(chat_id, text, reply_markup=keyboard)
+                self._reply(chat_id, text, reply_markup=keyboard, rich=rich)
                 if continued_text:
-                    self.api.send_message(chat_id, f"[Codex] assistant (continued)\n\n{continued_text}")
+                    self._reply(
+                        chat_id,
+                        f"<b>[Codex] assistant (continued)</b>\n\n{self._h(continued_text)}",
+                        rich=True,
+                    )
             except Exception:
                 logging.exception("failed to send telegram event")
 
@@ -1684,7 +1718,7 @@ class TelegramService(threading.Thread):
     ) -> Tuple[str, Optional[Dict[str, Any]]]:
         pending_id = int(pending["id"])
         payload_hash = str(pending["payload_hash"] or "")
-        lines = [f"[Codex] request_user_input", f"session: {session_label}"]
+        lines = ["<b>[Codex] request_user_input</b>", self._kv_html("session", session_label)]
         keyboard: Optional[Dict[str, Any]] = None
         try:
             payload = json.loads(str(pending["payload_json"]))
@@ -1707,10 +1741,10 @@ class TelegramService(threading.Thread):
             lines.append("error: invalid question payload")
             return "\n".join(lines), None
 
-        lines.append(f"question {question_index + 1}/{len(questions)}")
+        lines.append(self._kv_html("question", f"{question_index + 1}/{len(questions)}"))
         prompt = str(question.get("question", "")).strip()
         if prompt:
-            lines.append(f"prompt: {prompt}")
+            lines.append(self._kv_html("prompt", prompt))
 
         options = question.get("options", [])
         if not isinstance(options, list) or not options:
@@ -1723,11 +1757,11 @@ class TelegramService(threading.Thread):
             if not isinstance(option, dict):
                 continue
             label = str(option.get("label", f"option-{idx + 1}"))
-            lines.append(f"{idx + 1}. {label}")
+            lines.append(f"<b>{idx + 1}.</b> {self._h(label)}")
             description = str(option.get("description", "")).strip()
             if description:
                 description = re.sub(r"\s+", " ", description)
-                lines.append(f"   - {description}")
+                lines.append(f"<i>{self._h(description)}</i>")
             if callback_token:
                 cb = f"pick|{pending_id}|{question_index}|{idx}|{callback_token}"
                 buttons.append([{"text": label[:64], "callback_data": cb[:64]}])
@@ -1869,7 +1903,7 @@ class TelegramService(threading.Thread):
         session_label = f"{managed['alias']} ({session_id})" if managed else session_id
         text_next, keyboard_next = self._render_pending_question_message(session_label, pending_next)
         try:
-            self.api.send_message(chat_id, text_next, reply_markup=keyboard_next)
+            self._reply(chat_id, text_next, reply_markup=keyboard_next, rich=True)
         except Exception:
             logging.exception("failed to send next request_user_input question pending_id=%s next_idx=%s", pending_id, next_idx)
 
@@ -1928,7 +1962,7 @@ class TelegramService(threading.Thread):
 
         if not raw_text:
             if not self.db.is_chat_bound(chat_id):
-                self._reply(chat_id, "Not bound. Use /bind <binding_id>.")
+                self._reply(chat_id, "Not bound. Use <code>/bind &lt;binding_id&gt;</code>.", rich=True)
                 return
             if has_non_text_payload:
                 self._reply(
@@ -1941,38 +1975,40 @@ class TelegramService(threading.Thread):
         cmd, arg = self._split_command(text)
 
         if cmd == "/start":
-            self._send_main_menu(chat_id, "Use /bind <binding_id> to bind this chat.")
+            self._send_main_menu(chat_id, "Use <code>/bind &lt;binding_id&gt;</code> to bind this chat.", rich=True)
             return
 
         if cmd == "/help":
-            self._send_main_menu(
+            self._reply(
                 chat_id,
-                "Commands:\n"
-                "/bind <binding_id>\n"
-                "/unbind\n"
-                "/menu\n"
-                "/sessions\n"
-                "/select <alias|session_id>\n"
-                "/status\n"
-                "/send <text>\n"
-                "/mode <plan>\n"
-                "/approve\n"
-                "/reject\n\n"
-                "Tip: plain text (without leading /) is sent to the selected managed session.",
+                "<b>Commands</b>\n"
+                "<code>/bind &lt;binding_id&gt;</code>\n"
+                "<code>/unbind</code>\n"
+                "<code>/menu</code>\n"
+                "<code>/sessions</code>\n"
+                "<code>/select &lt;alias|session_id&gt;</code>\n"
+                "<code>/status</code>\n"
+                "<code>/send &lt;text&gt;</code>\n"
+                "<code>/mode &lt;plan&gt;</code>\n"
+                "<code>/approve</code>\n"
+                "<code>/reject</code>\n\n"
+                "<i>Tip: plain text (without leading /) is sent to the selected managed session.</i>",
+                reply_markup=self._main_menu_keyboard(),
+                rich=True,
             )
             return
 
         if cmd == "/bind":
             if self.db.is_chat_bound(chat_id):
-                self._reply(chat_id, "Already bound.")
+                self._reply(chat_id, "<b>Already bound.</b>", rich=True)
                 return
             token = normalize_binding_id(arg)
             if not token or not is_valid_binding_id(token):
-                self._reply(chat_id, "Usage: /bind <binding_id>")
+                self._reply(chat_id, "Usage: <code>/bind &lt;binding_id&gt;</code>", rich=True)
                 return
             ok, msg = self.db.consume_bind_token(hash_binding_id(token), chat_id)
             if not ok:
-                self._reply(chat_id, f"Bind failed: {msg}")
+                self._reply(chat_id, f"<b>Bind failed:</b> {self._h(msg)}", rich=True)
                 return
             self.db.bind_chat(chat_id, username)
             self._send_main_menu(chat_id, "Bind success. Use buttons or commands to control sessions.")
@@ -1980,45 +2016,50 @@ class TelegramService(threading.Thread):
 
         if cmd == "/unbind":
             self.db.unbind_chat(chat_id)
-            self._reply(chat_id, "Unbound.")
+            self._reply(chat_id, "<b>Unbound.</b>", rich=True)
             return
 
         if cmd == "/menu":
             if not self.db.is_chat_bound(chat_id):
-                self._reply(chat_id, "Not bound. Use /bind <binding_id>.")
+                self._reply(chat_id, "Not bound. Use <code>/bind &lt;binding_id&gt;</code>.", rich=True)
                 return
             self._send_main_menu(chat_id, "Main menu ready.")
             return
 
         if not self.db.is_chat_bound(chat_id):
-            self._reply(chat_id, "Not bound. Use /bind <binding_id>.")
+            self._reply(chat_id, "Not bound. Use <code>/bind &lt;binding_id&gt;</code>.", rich=True)
             return
 
         if cmd == "/sessions":
             text_page, keyboard, _ = self._render_sessions_page(chat_id, page=0)
-            self._reply(chat_id, text_page, reply_markup=keyboard)
+            self._reply(chat_id, text_page, reply_markup=keyboard, rich=True)
             return
 
         if cmd == "/select":
             if not arg:
                 text_page, keyboard, _ = self._render_sessions_page(chat_id, page=0)
-                self._reply(chat_id, text_page, reply_markup=keyboard)
+                self._reply(chat_id, text_page, reply_markup=keyboard, rich=True)
                 return
             ref = self._resolve_session_ref(arg)
             if not ref:
-                self._reply(chat_id, "Session not found.")
+                self._reply(chat_id, "<b>Session not found.</b>", rich=True)
                 return
             self.db.set_selected_session(chat_id, ref)
-            self._reply(chat_id, f"Selected: {ref}")
+            self._reply(
+                chat_id,
+                f"<b>Selected:</b> <code>{self._h(ref)}</code>\n{self._format_selected_status_html(chat_id)}",
+                reply_markup=self._main_menu_keyboard(),
+                rich=True,
+            )
             return
 
         if cmd == "/status":
-            self._reply(chat_id, self._format_selected_status(chat_id))
+            self._reply(chat_id, self._format_selected_status_html(chat_id), rich=True)
             return
 
         if cmd == "/send":
             if not arg:
-                self._reply(chat_id, "Usage: /send <text>")
+                self._reply(chat_id, "Usage: <code>/send &lt;text&gt;</code>", rich=True)
                 return
             session_id = self._selected_session_id(chat_id)
             if not session_id:
@@ -2038,7 +2079,7 @@ class TelegramService(threading.Thread):
                 )
                 return
             else:
-                self._reply(chat_id, "Usage: /mode <plan>")
+                self._reply(chat_id, "Usage: <code>/mode &lt;plan&gt;</code>", rich=True)
                 return
             session_id = self._selected_session_id(chat_id)
             if not session_id:
@@ -2176,8 +2217,231 @@ class TelegramService(threading.Thread):
             return normalized[1][0]
         return normalized[0][0]
 
-    def _reply(self, chat_id: int, text: str, reply_markup: Optional[Dict[str, Any]] = None) -> None:
-        self.api.send_message(chat_id, text, reply_markup=reply_markup)
+    @staticmethod
+    def _h(value: Any) -> str:
+        return html.escape(str(value), quote=False)
+
+    @staticmethod
+    def _html_to_plain(text: str) -> str:
+        no_tags = re.sub(r"</?(?:b|i|u|code|pre)>", "", text)
+        no_tags = re.sub(r"<br\s*/?>", "\n", no_tags)
+        return html.unescape(no_tags)
+
+    def _kv_html(self, label: str, value: Any, code: bool = False) -> str:
+        escaped = self._h(value)
+        if code:
+            escaped = f"<code>{escaped}</code>"
+        return f"<b>{self._h(label)}:</b> {escaped}"
+
+    def _sanitize_html(self, text: str) -> str:
+        def _replace_tag(match: re.Match[str]) -> str:
+            token = match.group(0)
+            kind, _ = self._parse_supported_tag(token)
+            return token if kind in ("open", "close") else self._h(token)
+
+        return re.sub(r"<[^>]+>", _replace_tag, text)
+
+    @classmethod
+    def _parse_supported_tag(cls, token: str) -> Tuple[Optional[str], Optional[str]]:
+        m = re.fullmatch(r"<(/?)([a-zA-Z0-9]+)>", token.strip())
+        if not m:
+            return None, None
+        name = m.group(2).lower()
+        if name not in cls.SUPPORTED_HTML_TAGS:
+            return None, None
+        return ("close" if m.group(1) else "open"), name
+
+    @staticmethod
+    def _pick_plain_cut(text: str, max_len: int) -> int:
+        if len(text) <= max_len:
+            return len(text)
+        cut = max_len
+        newline_pos = text.rfind("\n", 0, cut + 1)
+        if newline_pos >= max_len // 2:
+            return newline_pos + 1
+        space_pos = text.rfind(" ", 0, cut + 1)
+        if space_pos >= max_len // 2:
+            return space_pos + 1
+        return cut
+
+    @staticmethod
+    def _pick_html_text_cut(text: str, max_len: int) -> int:
+        if len(text) <= max_len:
+            return len(text)
+        cut = TelegramService._pick_plain_cut(text, max_len)
+        amp = text.rfind("&", 0, cut)
+        semicolon = text.rfind(";", 0, cut)
+        if amp != -1 and semicolon < amp:
+            candidate = text[amp:cut]
+            if re.fullmatch(r"&(?:#\d{1,8}|#x[0-9A-Fa-f]{1,8}|[A-Za-z][A-Za-z0-9]{1,31})?", candidate):
+                if amp > 0:
+                    cut = amp
+        return max(1, cut)
+
+    def _split_plain_chunks(self, text: str, max_len: Optional[int] = None) -> List[str]:
+        normalized = text.replace("\r\n", "\n")
+        limit = max(32, min(max_len or self.TELEGRAM_CHUNK_SOFT_LIMIT, self.TELEGRAM_TEXT_LIMIT))
+        if len(normalized) <= limit:
+            return [normalized]
+
+        chunks: List[str] = []
+        remaining = normalized
+        while remaining:
+            if len(remaining) <= limit:
+                chunks.append(remaining)
+                break
+            cut = self._pick_plain_cut(remaining, limit)
+            if cut <= 0:
+                cut = limit
+            chunk = remaining[:cut]
+            if not chunk:
+                chunk = remaining[:limit]
+                cut = len(chunk)
+            chunks.append(chunk)
+            remaining = remaining[cut:]
+        return [c for c in chunks if c] or [normalized]
+
+    def _split_html_chunks(self, text: str, max_len: Optional[int] = None) -> List[str]:
+        normalized = text.replace("\r\n", "\n")
+        limit = max(32, min(max_len or self.TELEGRAM_CHUNK_SOFT_LIMIT, self.TELEGRAM_TEXT_LIMIT))
+        if len(normalized) <= limit:
+            return [normalized]
+
+        tokens = [tok for tok in re.split(r"(<[^>]+>)", normalized) if tok]
+        chunks: List[str] = []
+        open_tags: List[str] = []
+        chunk_prefix_tags: List[str] = []
+        chunk_parts: List[str] = []
+        chunk_body_len = 0
+
+        def _open_prefix(tags: List[str]) -> str:
+            return "".join(f"<{tag}>" for tag in tags)
+
+        def _close_suffix(tags: List[str]) -> str:
+            return "".join(f"</{tag}>" for tag in reversed(tags))
+
+        def _render_chunk() -> str:
+            return f"{_open_prefix(chunk_prefix_tags)}{''.join(chunk_parts)}{_close_suffix(open_tags)}"
+
+        def _start_new_chunk() -> None:
+            nonlocal chunk_prefix_tags, chunk_parts, chunk_body_len
+            chunk_prefix_tags = list(open_tags)
+            chunk_parts = []
+            chunk_body_len = 0
+
+        def _append_part(part: str) -> None:
+            nonlocal chunk_body_len
+            if not part:
+                return
+            chunk_parts.append(part)
+            chunk_body_len += len(part)
+
+        _start_new_chunk()
+
+        for token in tokens:
+            token_kind, token_name = self._parse_supported_tag(token)
+            if token.startswith("<") and token.endswith(">") and token_kind is None:
+                # Escape unknown tags to keep parse_mode=HTML stable.
+                token = self._h(token)
+                token_kind, token_name = None, None
+
+            if token_kind in ("open", "close"):
+                while True:
+                    prefix_len = len(_open_prefix(chunk_prefix_tags))
+                    suffix_len = len(_close_suffix(open_tags))
+                    available = limit - (prefix_len + chunk_body_len + suffix_len)
+                    if available < len(token) and chunk_parts:
+                        rendered = _render_chunk()
+                        if rendered:
+                            chunks.append(rendered)
+                        _start_new_chunk()
+                        continue
+                    break
+
+                _append_part(token)
+                if token_kind == "open" and token_name is not None:
+                    open_tags.append(token_name)
+                elif token_kind == "close" and token_name is not None:
+                    if open_tags and open_tags[-1] == token_name:
+                        open_tags.pop()
+                    elif token_name in open_tags:
+                        idx = len(open_tags) - 1 - open_tags[::-1].index(token_name)
+                        del open_tags[idx]
+                continue
+
+            remaining_text = token
+            while remaining_text:
+                prefix_len = len(_open_prefix(chunk_prefix_tags))
+                suffix_len = len(_close_suffix(open_tags))
+                available = limit - (prefix_len + chunk_body_len + suffix_len)
+                if available <= 0:
+                    rendered = _render_chunk()
+                    if rendered:
+                        chunks.append(rendered)
+                    _start_new_chunk()
+                    continue
+                if len(remaining_text) <= available:
+                    _append_part(remaining_text)
+                    remaining_text = ""
+                    continue
+                cut = self._pick_html_text_cut(remaining_text, available)
+                if cut <= 0:
+                    cut = min(len(remaining_text), max(1, available))
+                _append_part(remaining_text[:cut])
+                remaining_text = remaining_text[cut:]
+                rendered = _render_chunk()
+                if rendered:
+                    chunks.append(rendered)
+                _start_new_chunk()
+
+        final_chunk = _render_chunk()
+        if final_chunk:
+            chunks.append(final_chunk)
+        return [c for c in chunks if c] or [normalized]
+
+    def _reply(
+        self,
+        chat_id: int,
+        text: str,
+        reply_markup: Optional[Dict[str, Any]] = None,
+        rich: bool = False,
+        disable_preview: Optional[bool] = None,
+    ) -> None:
+        html_text = self._sanitize_html(text) if rich else self._h(text)
+        chunks = self._split_html_chunks(html_text)
+        total_chunks = len(chunks)
+
+        for idx, chunk in enumerate(chunks, start=1):
+            chunk_markup = reply_markup if idx == 1 else None
+            payload_text = chunk if chunk else " "
+            try:
+                self.api.send_message(
+                    chat_id,
+                    payload_text,
+                    reply_markup=chunk_markup,
+                    parse_mode="HTML",
+                    disable_web_page_preview=disable_preview,
+                )
+                continue
+            except Exception:
+                logging.exception(
+                    "telegram html send failed chat_id=%s rich=%s len=%s chunk=%s/%s; fallback to plain",
+                    chat_id,
+                    rich,
+                    len(html_text),
+                    idx,
+                    total_chunks,
+                )
+            plain_chunk = self._html_to_plain(chunk)
+            plain_chunks = self._split_plain_chunks(plain_chunk)
+            for pidx, plain_text in enumerate(plain_chunks, start=1):
+                plain_markup = chunk_markup if pidx == 1 else None
+                self.api.send_message(
+                    chat_id,
+                    plain_text if plain_text else " ",
+                    reply_markup=plain_markup,
+                    disable_web_page_preview=disable_preview,
+                )
 
     def _resolve_session_ref(self, value: str) -> Optional[str]:
         m = self.db.get_managed_by_alias(value)
@@ -2279,6 +2543,42 @@ class TelegramService(threading.Thread):
 
         pendings = self.db.get_pending_for_session(session_id)
         lines.append(f"pending items: {len(pendings)}")
+        return "\n".join(lines)
+
+    def _format_selected_status_html(self, chat_id: int) -> str:
+        ref = self.db.get_selected_session(chat_id)
+        if not ref:
+            return "No selected session. Use <code>/sessions</code>."
+
+        session_id = self._selected_session_id(chat_id)
+        lines = [self._kv_html("selected", ref, code=True)]
+
+        if not session_id:
+            lines.append(self._kv_html("resolved session", "none"))
+            return "\n".join(lines)
+
+        if session_id.startswith("alias::"):
+            alias = session_id.split("::", 1)[1]
+            row = self.db.get_managed_by_alias(alias)
+            if row:
+                lines.append(self._kv_html("managed alias", alias))
+                lines.append(self._kv_html("codex_session_id", row["codex_session_id"] or "(waiting for session id)", code=True))
+                lines.append(self._kv_html("status", row["status"]))
+                pendings = self.db.get_pending_for_session(str(row["codex_session_id"])) if row["codex_session_id"] else []
+                lines.append(self._kv_html("pending items", len(pendings)))
+                return "\n".join(lines)
+            lines.append(self._kv_html("managed alias", "not found"))
+            return "\n".join(lines)
+
+        row = self.db.get_managed_by_session_id(session_id)
+        if row:
+            lines.append(self._kv_html("managed alias", row["alias"]))
+            lines.append(self._kv_html("status", row["status"]))
+        else:
+            lines.append(self._kv_html("session mode", "legacy (notify-only)"))
+
+        pendings = self.db.get_pending_for_session(session_id)
+        lines.append(self._kv_html("pending items", len(pendings)))
         return "\n".join(lines)
 
 
