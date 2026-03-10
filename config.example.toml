@@ -8,6 +8,7 @@ proxy_url = ""
 connect_timeout_sec = 10
 read_timeout_sec = 30
 api_base = "https://api.telegram.org"
+markdown_render_enabled = true
 
 [slack]
 enabled = false

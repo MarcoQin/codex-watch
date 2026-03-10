@@ -21,6 +21,7 @@ Local monitor + multi-channel bridge (Telegram + Slack) for multiple Codex sessi
 - Telegram command menu (`/` autocomplete) is registered automatically on startup.
 - Core notifications and command replies use Telegram HTML rendering for better readability.
 - Long Telegram messages are auto-split safely (with HTML-aware chunking + plain-text fallback).
+- Assistant Markdown in Telegram notifications is auto-rendered (common syntax subset).
 - Multi-channel event fan-out: one monitor event can be delivered to Telegram and Slack at the same time.
 - `/sessions` and `/select` support inline clickable managed-session picker with pagination.
 - Plain text (without leading `/`) is sent to the selected managed session.
@@ -73,6 +74,7 @@ proxy_url = "http://127.0.0.1:7890"  # optional, recommended if direct Telegram 
 connect_timeout_sec = 10
 read_timeout_sec = 30
 api_base = "https://api.telegram.org"
+markdown_render_enabled = true
 
 [slack]
 enabled = false

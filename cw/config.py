@@ -38,6 +38,7 @@ class Config:
     telegram_connect_timeout_sec: int
     telegram_read_timeout_sec: int
     telegram_api_base: str
+    telegram_markdown_render_enabled: bool
 
     slack_enabled: bool
     slack_bot_token: str
@@ -85,6 +86,7 @@ def load_config(path: str) -> Config:
     telegram_connect_timeout_sec = int(deep_get(raw, ["telegram", "connect_timeout_sec"], 10))
     telegram_read_timeout_sec = int(deep_get(raw, ["telegram", "read_timeout_sec"], 30))
     telegram_api_base = str(deep_get(raw, ["telegram", "api_base"], "https://api.telegram.org")).strip()
+    telegram_markdown_render_enabled = bool(deep_get(raw, ["telegram", "markdown_render_enabled"], True))
 
     slack_enabled = bool(deep_get(raw, ["slack", "enabled"], False))
     slack_bot_token = str(deep_get(raw, ["slack", "bot_token"], "")).strip()
@@ -157,6 +159,7 @@ def load_config(path: str) -> Config:
         telegram_connect_timeout_sec=max(1, telegram_connect_timeout_sec),
         telegram_read_timeout_sec=max(1, telegram_read_timeout_sec),
         telegram_api_base=telegram_api_base or "https://api.telegram.org",
+        telegram_markdown_render_enabled=telegram_markdown_render_enabled,
         slack_enabled=slack_enabled,
         slack_bot_token=slack_bot_token,
         slack_app_token=slack_app_token,
@@ -179,6 +182,7 @@ proxy_url = ""
 connect_timeout_sec = 10
 read_timeout_sec = 30
 api_base = "https://api.telegram.org"
+markdown_render_enabled = true
 
 [slack]
 enabled = false

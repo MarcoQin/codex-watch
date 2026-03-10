@@ -118,7 +118,7 @@ class TelegramService(threading.Thread):
     SESSIONS_PAGE_SIZE = 6
     TELEGRAM_TEXT_LIMIT = 4096
     TELEGRAM_CHUNK_SOFT_LIMIT = 3800
-    SUPPORTED_HTML_TAGS = ("b", "i", "u", "code")
+    SUPPORTED_HTML_TAGS = ("b", "i", "u", "code", "pre")
 
     def __init__(self, cfg: Config, db: DB, stop_event: threading.Event):
         super().__init__(daemon=True)
@@ -407,7 +407,7 @@ class TelegramService(threading.Thread):
             if primary:
                 lines.append("")
                 lines.append("<b>assistant summary:</b>")
-                lines.append(self._h(primary))
+                lines.append(self._render_assistant_text_html(primary))
             text = "\n".join(lines)
             rich = True
         elif etype == "proposed_plan_ready":
@@ -422,7 +422,7 @@ class TelegramService(threading.Thread):
             if primary:
                 lines.append("")
                 lines.append("<b>assistant summary:</b>")
-                lines.append(self._h(primary))
+                lines.append(self._render_assistant_text_html(primary))
             text = "\n".join(lines)
             rich = True
             try:
@@ -459,7 +459,7 @@ class TelegramService(threading.Thread):
                 if continued_text:
                     self._reply(
                         chat_id,
-                        f"<b>[Codex] assistant (continued)</b>\n\n{self._h(continued_text)}",
+                        f"<b>[Codex] assistant (continued)</b>\n\n{self._render_assistant_text_html(continued_text)}",
                         rich=True,
                     )
             except Exception:
@@ -971,6 +971,105 @@ class TelegramService(threading.Thread):
             return normalized[1][0]
         return normalized[0][0]
 
+    def _render_assistant_text_html(self, text: str) -> str:
+        if not text:
+            return ""
+        if not self.cfg.telegram_markdown_render_enabled:
+            return self._h(text)
+        return self._markdown_to_html(text)
+
+    def _markdown_to_html(self, text: str) -> str:
+        normalized = text.replace("\r\n", "\n")
+        lines = normalized.split("\n")
+        out: List[str] = []
+        in_code_block = False
+        code_lines: List[str] = []
+
+        for line in lines:
+            if line.strip().startswith("```"):
+                if in_code_block:
+                    code_block_text = "\n".join(code_lines)
+                    out.append(f"<pre><code>{self._h(code_block_text)}</code></pre>")
+                    code_lines = []
+                    in_code_block = False
+                else:
+                    if code_lines:
+                        out.append(self._h("\n".join(code_lines)))
+                        code_lines = []
+                    in_code_block = True
+                continue
+
+            if in_code_block:
+                code_lines.append(line)
+                continue
+
+            out.append(self._markdown_line_to_html(line))
+
+        if in_code_block:
+            code_block_text = "\n".join(code_lines)
+            out.append(f"<pre><code>{self._h(code_block_text)}</code></pre>")
+
+        return "\n".join(out)
+
+    def _markdown_line_to_html(self, line: str) -> str:
+        if not line:
+            return ""
+
+        stripped = line.lstrip()
+        if not stripped:
+            return ""
+
+        heading = re.match(r"^(#{1,6})\s+(.*)$", stripped)
+        if heading:
+            return f"<b>{self._markdown_inline_to_html(heading.group(2).strip())}</b>"
+
+        if stripped.startswith(">"):
+            content = stripped[1:].lstrip()
+            return f"<i>{self._markdown_inline_to_html(content)}</i>"
+
+        ordered = re.match(r"^(\d+)\.\s+(.*)$", stripped)
+        if ordered:
+            return f"{ordered.group(1)}. {self._markdown_inline_to_html(ordered.group(2))}"
+
+        unordered = re.match(r"^[-*]\s+(.*)$", stripped)
+        if unordered:
+            return f"• {self._markdown_inline_to_html(unordered.group(1))}"
+
+        return self._markdown_inline_to_html(line)
+
+    def _markdown_inline_to_html(self, text: str) -> str:
+        if not text:
+            return ""
+
+        placeholders: List[str] = []
+
+        def _save(fragment: str) -> str:
+            placeholders.append(fragment)
+            return f"@@CWMD{len(placeholders) - 1}@@"
+
+        def _replace_code(match: re.Match[str]) -> str:
+            return _save(f"<code>{self._h(match.group(1))}</code>")
+
+        def _replace_link(match: re.Match[str]) -> str:
+            label = self._h(match.group(1).strip())
+            url = match.group(2).strip()
+            if re.fullmatch(r"https?://\\S+", url):
+                return _save(f"{label} ({self._h(url)})")
+            return _save(f"{label} ({self._h(url)})")
+
+        working = re.sub(r"`([^`\n]+)`", _replace_code, text)
+        working = re.sub(r"\[([^\]\n]+)\]\(([^)\n]+)\)", _replace_link, working)
+        working = self._h(working)
+
+        # Bold first, then italic.
+        working = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", working)
+        working = re.sub(r"(?<!\*)\*(?!\s)(.+?)(?<!\s)\*(?!\*)", r"<i>\1</i>", working)
+        working = re.sub(r"(?<!\w)_(?!\s)(.+?)(?<!\s)_(?!\w)", r"<i>\1</i>", working)
+
+        for idx, fragment in enumerate(placeholders):
+            working = working.replace(f"@@CWMD{idx}@@", fragment)
+        return working
+
     @staticmethod
     def _h(value: Any) -> str:
         return html.escape(str(value), quote=False)
@@ -1334,4 +1433,3 @@ class TelegramService(threading.Thread):
         pendings = self.db.get_pending_for_session(session_id)
         lines.append(self._kv_html("pending items", len(pendings)))
         return "\n".join(lines)
-
