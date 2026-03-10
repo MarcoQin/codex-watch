@@ -109,9 +109,10 @@ Notes:
 - `/approve`
 - `/reject`
 
-`request_user_input` events include inline buttons for quick option selection.
+`request_user_input` events include inline buttons and option descriptions in the message body.
 `/sessions` returns clickable paged buttons for fast selection.
 Any non-command text is forwarded to the currently selected managed session.
+Image/file messages are not supported yet; the bot prompts you to send text or an image link with context.
 
 ## Runtime Paths
 

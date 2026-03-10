@@ -1724,6 +1724,10 @@ class TelegramService(threading.Thread):
                 continue
             label = str(option.get("label", f"option-{idx + 1}"))
             lines.append(f"{idx + 1}. {label}")
+            description = str(option.get("description", "")).strip()
+            if description:
+                description = re.sub(r"\s+", " ", description)
+                lines.append(f"   - {description}")
             if callback_token:
                 cb = f"pick|{pending_id}|{question_index}|{idx}|{callback_token}"
                 buttons.append([{"text": label[:64], "callback_data": cb[:64]}])
@@ -1917,8 +1921,20 @@ class TelegramService(threading.Thread):
         chat_id = int(chat.get("id", 0))
         raw_text = str(message.get("text", "")).strip()
         username = str(from_user.get("username") or from_user.get("first_name") or "unknown")
+        has_non_text_payload = any(
+            key in message
+            for key in ("photo", "sticker", "document", "video", "voice", "audio", "animation", "video_note")
+        )
 
         if not raw_text:
+            if not self.db.is_chat_bound(chat_id):
+                self._reply(chat_id, "Not bound. Use /bind <binding_id>.")
+                return
+            if has_non_text_payload:
+                self._reply(
+                    chat_id,
+                    "Image/file messages are not supported yet. Please send text, or send an image link with context.",
+                )
             return
 
         text = self._normalize_message_text(raw_text)
