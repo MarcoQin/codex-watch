@@ -17,6 +17,7 @@ Local monitor + Telegram control bridge for multiple Codex sessions.
 - Telegram command menu (`/` autocomplete) is registered automatically on startup.
 - `/sessions` and `/select` support inline clickable managed-session picker with pagination.
 - Plain text (without leading `/`) is sent to the selected managed session.
+- `default` mode switching is not supported via chat in this Codex environment.
 - Persists Telegram `update_offset` to avoid replay after restart.
 - On first discovery of old session files, backfills recent lines for pending actions.
 
@@ -104,7 +105,7 @@ Notes:
 - `/select <alias|session_id>`
 - `/status`
 - `/send <text>`
-- `/mode <plan|default>`
+- `/mode <plan>`
 - `/approve`
 - `/reject`
 

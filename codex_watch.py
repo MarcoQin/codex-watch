@@ -1456,7 +1456,7 @@ class TelegramService(threading.Thread):
             {"command": "sessions", "description": "List/select managed sessions"},
             {"command": "select", "description": "Select a managed session"},
             {"command": "status", "description": "Show selected session status"},
-            {"command": "mode", "description": "Switch mode: /mode <plan|default>"},
+            {"command": "mode", "description": "Switch mode: /mode plan"},
             {"command": "approve", "description": "Approve pending action"},
             {"command": "reject", "description": "Reject pending action"},
             {"command": "send", "description": "Send text to selected session"},
@@ -1473,7 +1473,7 @@ class TelegramService(threading.Thread):
         return {
             "keyboard": [
                 [{"text": "Sessions"}, {"text": "Select"}, {"text": "Status"}, {"text": "Help"}],
-                [{"text": "Plan"}, {"text": "Default"}, {"text": "Approve"}, {"text": "Reject"}],
+                [{"text": "Plan"}, {"text": "Approve"}, {"text": "Reject"}],
             ],
             "resize_keyboard": True,
             "is_persistent": True,
@@ -1491,6 +1491,7 @@ class TelegramService(threading.Thread):
             "Help": "/help",
             "Menu": "/menu",
             "Plan": "/mode plan",
+            # Keep compatibility with stale keyboards that still show "Default".
             "Default": "/mode default",
             "Approve": "/approve",
             "Reject": "/reject",
@@ -1938,7 +1939,7 @@ class TelegramService(threading.Thread):
                 "/select <alias|session_id>\n"
                 "/status\n"
                 "/send <text>\n"
-                "/mode <plan|default>\n"
+                "/mode <plan>\n"
                 "/approve\n"
                 "/reject\n\n"
                 "Tip: plain text (without leading /) is sent to the selected managed session.",
@@ -2015,9 +2016,13 @@ class TelegramService(threading.Thread):
             if arg == "plan":
                 text_to_send = self.cfg.mode_plan_template
             elif arg == "default":
-                text_to_send = self.cfg.mode_default_template
+                self._reply(
+                    chat_id,
+                    "Default mode cannot be switched via chat in this Codex environment.",
+                )
+                return
             else:
-                self._reply(chat_id, "Usage: /mode <plan|default>")
+                self._reply(chat_id, "Usage: /mode <plan>")
                 return
             session_id = self._selected_session_id(chat_id)
             if not session_id:
