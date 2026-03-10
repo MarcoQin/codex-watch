@@ -6,7 +6,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import List
+from typing import List, Optional, Tuple
 
 from .common import (
     APP_NAME,
@@ -79,16 +79,35 @@ def cmd_run_session(args: argparse.Namespace, cfg: Config, db: DB) -> int:
     return 0
 
 
+def _managed_tmux_health(row, tmux: TmuxController) -> Tuple[bool, Optional[str]]:
+    tmux_session = str(row["tmux_session"] or "").strip()
+    pane = str(row["tmux_pane"] or "").strip()
+    if not tmux_session:
+        return False, "missing tmux session"
+    if not pane:
+        return False, "missing tmux pane"
+    if not tmux.session_exists(tmux_session):
+        return False, "tmux session not found"
+    if not tmux.pane_belongs_to_session(tmux_session, pane):
+        return False, "tmux pane mismatch"
+    return True, None
+
+
 def cmd_sessions_list(db: DB) -> int:
+    tmux = TmuxController()
     managed = db.list_managed_sessions()
     print("Managed sessions:")
     if not managed:
         print("- none")
     else:
         for row in managed:
+            healthy, orphan_reason = _managed_tmux_health(row, tmux)
+            orphan_flag = "no" if healthy else "yes"
+            reason = f" orphan_reason={orphan_reason}" if orphan_reason else ""
             print(
                 f"- alias={row['alias']} status={row['status']} "
-                f"session_id={row['codex_session_id'] or '-'} pane={row['tmux_pane']} cwd={row['cwd']} nonce={row['launch_nonce'] or '-'}"
+                f"session_id={row['codex_session_id'] or '-'} tmux={row['tmux_session']} pane={row['tmux_pane']} "
+                f"orphan={orphan_flag} cwd={row['cwd']} nonce={row['launch_nonce'] or '-'}{reason}"
             )
 
     managed_sids = {str(r["codex_session_id"]) for r in managed if r["codex_session_id"]}
@@ -127,6 +146,74 @@ def cmd_sessions_attach(args: argparse.Namespace, db: DB) -> int:
         print("attach failed: alias not found", file=sys.stderr)
         return 1
     print(f"attached alias={args.name} -> session_id={args.session_id}")
+    return 0
+
+
+def cmd_sessions_rm(args: argparse.Namespace, db: DB) -> int:
+    alias = args.name.strip()
+    row = db.get_managed_by_alias(alias)
+    if not row:
+        print(f"remove failed: alias not found: {alias}", file=sys.stderr)
+        return 1
+
+    tmux = TmuxController()
+    healthy, orphan_reason = _managed_tmux_health(row, tmux)
+    if healthy and not args.force:
+        print(
+            f"refusing to remove active session alias={alias}; use --force to override",
+            file=sys.stderr,
+        )
+        return 1
+
+    ok = db.delete_managed_session(alias)
+    if not ok:
+        print(f"remove failed: alias not found: {alias}", file=sys.stderr)
+        return 1
+
+    reason = "forced" if healthy else (orphan_reason or "orphan")
+    print(f"removed alias={alias} reason={reason}")
+    return 0
+
+
+def cmd_sessions_prune(args: argparse.Namespace, db: DB) -> int:
+    managed = db.list_managed_sessions()
+    tmux = TmuxController()
+
+    remove_candidates: List[Tuple[str, str]] = []
+    skipped_running: List[Tuple[str, str]] = []
+    for row in managed:
+        alias = str(row["alias"])
+        healthy, orphan_reason = _managed_tmux_health(row, tmux)
+        if healthy:
+            continue
+        reason = orphan_reason or "orphan"
+        if str(row["status"]) == "running" and not args.force:
+            skipped_running.append((alias, reason))
+            continue
+        remove_candidates.append((alias, reason))
+
+    if not remove_candidates and not skipped_running:
+        print("no orphan managed sessions found")
+        return 0
+
+    if remove_candidates:
+        print("prune candidates:")
+        for alias, reason in remove_candidates:
+            print(f"- alias={alias} reason={reason}")
+    if skipped_running:
+        print("skipped running orphans (use --force):")
+        for alias, reason in skipped_running:
+            print(f"- alias={alias} reason={reason}")
+
+    if args.dry_run:
+        print("dry-run only; no records removed")
+        return 0
+
+    removed = 0
+    for alias, _reason in remove_candidates:
+        if db.delete_managed_session(alias):
+            removed += 1
+    print(f"removed {removed} managed sessions")
     return 0
 
 
@@ -257,6 +344,12 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     att = sess_sub.add_parser("attach")
     att.add_argument("--name", required=True)
     att.add_argument("--session-id", required=True)
+    rm = sess_sub.add_parser("rm")
+    rm.add_argument("name")
+    rm.add_argument("--force", action="store_true")
+    prune = sess_sub.add_parser("prune")
+    prune.add_argument("--dry-run", action="store_true")
+    prune.add_argument("--force", action="store_true")
 
     auth = sub.add_parser("auth")
     auth_sub = auth.add_subparsers(dest="auth_cmd", required=True)

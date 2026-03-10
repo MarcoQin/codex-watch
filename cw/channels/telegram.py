@@ -424,12 +424,15 @@ class TelegramService(threading.Thread):
         row = self.db.get_managed_by_session_id(sid)
         if not row:
             return None, "session is not managed"
+        tmux_session = str(row["tmux_session"] or "").strip()
         pane = str(row["tmux_pane"] or "").strip()
+        if not tmux_session:
+            return None, "missing tmux session"
         if not pane:
             return None, "missing tmux pane"
-        if not self.tmux.pane_exists(pane):
+        if (not self.tmux.session_exists(tmux_session)) or (not self.tmux.pane_belongs_to_session(tmux_session, pane)):
             self.db.update_managed_status_by_alias(str(row["alias"]), "stopped")
-            return None, "tmux pane not running"
+            return None, "tmux session/pane not running"
         return row, "ok"
 
     def _resolve_view_target_from_chat(self, chat_id: int) -> Tuple[Optional[sqlite3.Row], str]:
@@ -1485,13 +1488,16 @@ class TelegramService(threading.Thread):
         if not row:
             return False, "session is not managed (legacy session is notify-only)"
 
-        pane = str(row["tmux_pane"] or "")
+        tmux_session = str(row["tmux_session"] or "").strip()
+        pane = str(row["tmux_pane"] or "").strip()
+        if not tmux_session:
+            return False, "missing tmux session"
         if not pane:
             return False, "missing tmux pane"
 
-        if not self.tmux.pane_exists(pane):
+        if (not self.tmux.session_exists(tmux_session)) or (not self.tmux.pane_belongs_to_session(tmux_session, pane)):
             self.db.update_managed_status_by_alias(str(row["alias"]), "stopped")
-            return False, "tmux pane not running"
+            return False, "tmux session/pane not running"
 
         try:
             self.tmux.send_text_with_policy(pane, text, self.tmux_send_policy, enter=True)

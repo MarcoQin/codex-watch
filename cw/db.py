@@ -324,6 +324,12 @@ class DB:
             cur = self.conn.execute("SELECT * FROM managed_sessions ORDER BY created_at DESC")
             return cur.fetchall()
 
+    def delete_managed_session(self, alias: str) -> bool:
+        with self.lock:
+            cur = self.conn.execute("DELETE FROM managed_sessions WHERE alias=?", (alias,))
+            self.conn.commit()
+            return cur.rowcount > 0
+
     def upsert_session_file(
         self,
         file_path: str,
@@ -606,5 +612,4 @@ class DB:
                 (utc_ts(), pending_id),
             )
             self.conn.commit()
-
 

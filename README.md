@@ -131,6 +131,8 @@ Notes:
 
 ./codex-watch sessions list
 ./codex-watch sessions attach --name <alias> --session-id <id>
+./codex-watch sessions rm <alias> [--force]
+./codex-watch sessions prune [--dry-run] [--force]
 ./codex-watch channels status
 ```
 
@@ -201,6 +203,10 @@ tail -f ~/.local/state/codex-watch/codex-watch.log
 - Dedup key: `session_id + turn_id + trigger_type`.
 - Old sessions are auto-discovered from `~/.codex/sessions`.
 - Control commands only work for managed sessions with active tmux panes.
+- Managed session health checks use `tmux_session + tmux_pane` together (prevents cross-session pane-id reuse false positives).
+- `sessions list` shows `orphan=yes/no` and `orphan_reason` when detected.
+- `sessions rm` deletes one managed session record (refuses active records unless `--force`).
+- `sessions prune` removes orphan managed sessions in bulk (`--dry-run` to preview; running orphans require `--force`).
 - If a pane disappears, managed session status is marked as `stopped`.
 - Telegram `update_offset` is persisted in SQLite (`kv_store`).
 - Tmux send behavior is configurable; default uses `keys` mode with delayed Enter + one retry Enter.

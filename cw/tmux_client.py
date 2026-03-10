@@ -37,6 +37,25 @@ class TmuxController:
         except subprocess.CalledProcessError:
             return False
 
+    def session_exists(self, session_name: str) -> bool:
+        if not session_name:
+            return False
+        try:
+            self._run_tmux(["has-session", "-t", session_name], check=True)
+            return True
+        except subprocess.CalledProcessError:
+            return False
+
+    def pane_belongs_to_session(self, session_name: str, pane_id: str) -> bool:
+        if not session_name or not pane_id:
+            return False
+        try:
+            result = self._run_tmux(["list-panes", "-t", session_name, "-F", "#{pane_id}"], check=True)
+        except subprocess.CalledProcessError:
+            return False
+        panes = {line.strip() for line in result.stdout.splitlines() if line.strip()}
+        return pane_id in panes
+
     def capture_pane_text(self, pane_id: str, lines: int = 80) -> str:
         tail_lines = max(1, int(lines))
         result = self._run_tmux(["capture-pane", "-p", "-J", "-t", pane_id, "-S", f"-{tail_lines}", "-E", "-"])

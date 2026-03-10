@@ -12,6 +12,8 @@ from .cli import (
     cmd_run_session,
     cmd_sessions_attach,
     cmd_sessions_list,
+    cmd_sessions_prune,
+    cmd_sessions_rm,
     parse_args,
 )
 from .common import setup_logging
@@ -59,6 +61,10 @@ def main(argv):
                 return cmd_sessions_list(db)
             if args.sessions_cmd == "attach":
                 return cmd_sessions_attach(args, db)
+            if args.sessions_cmd == "rm":
+                return cmd_sessions_rm(args, db)
+            if args.sessions_cmd == "prune":
+                return cmd_sessions_prune(args, db)
         return 1
     finally:
         db.close()
