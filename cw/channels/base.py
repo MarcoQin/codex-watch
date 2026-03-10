@@ -1,0 +1,9 @@
+from typing import Any, Dict, Protocol
+
+
+class EventChannel(Protocol):
+    def start(self) -> None: ...
+
+    def join(self, timeout: float = ...) -> None: ...
+
+    def publish_event(self, event: Dict[str, Any]) -> None: ...

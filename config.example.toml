@@ -1,3 +1,6 @@
+[channels]
+enabled = ["telegram"]
+
 [telegram]
 bot_token = ""
 poll_interval_sec = 2
@@ -5,6 +8,16 @@ proxy_url = ""
 connect_timeout_sec = 10
 read_timeout_sec = 30
 api_base = "https://api.telegram.org"
+
+[slack]
+enabled = false
+bot_token = ""
+app_token = ""
+default_channel = ""
+channel_map = {}
+api_base = "https://slack.com/api"
+connect_timeout_sec = 10
+read_timeout_sec = 30
 
 [auth]
 binding_id_ttl_sec = 600
