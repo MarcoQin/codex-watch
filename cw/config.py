@@ -31,6 +31,12 @@ class Config:
     approve_plan_template: str
     reject_plan_template: str
 
+    tmux_send_strategy: str
+    tmux_enter_delay_ms: int
+    tmux_retry_enter_enabled: bool
+    tmux_retry_enter_delay_ms: int
+    tmux_retry_enter_count: int
+
     enabled_channels: List[str]
 
     telegram_bot_token: str
@@ -138,6 +144,14 @@ def load_config(path: str) -> Config:
     reject_plan_template = str(
         deep_get(raw, ["commands", "reject_plan_template"], "Revise the plan with more detail, then resend it.")
     )
+    tmux_send_strategy = str(deep_get(raw, ["tmux", "send_strategy"], "keys")).strip().lower()
+    if tmux_send_strategy not in ("keys", "paste", "auto"):
+        tmux_send_strategy = "keys"
+    tmux_enter_delay_ms = int(deep_get(raw, ["tmux", "enter_delay_ms"], 100))
+    tmux_retry_enter_enabled = bool(deep_get(raw, ["tmux", "retry_enter_enabled"], True))
+    tmux_retry_enter_delay_ms = int(deep_get(raw, ["tmux", "retry_enter_delay_ms"], 250))
+    tmux_retry_enter_count = int(deep_get(raw, ["tmux", "retry_enter_count"], 1))
+    tmux_retry_enter_count = 1 if tmux_retry_enter_count > 0 else 0
 
     return Config(
         poll_interval_sec=max(1, poll_interval_sec),
@@ -153,6 +167,11 @@ def load_config(path: str) -> Config:
         mode_default_template=mode_default_template,
         approve_plan_template=approve_plan_template,
         reject_plan_template=reject_plan_template,
+        tmux_send_strategy=tmux_send_strategy,
+        tmux_enter_delay_ms=max(0, tmux_enter_delay_ms),
+        tmux_retry_enter_enabled=tmux_retry_enter_enabled,
+        tmux_retry_enter_delay_ms=max(0, tmux_retry_enter_delay_ms),
+        tmux_retry_enter_count=tmux_retry_enter_count,
         enabled_channels=enabled_channels,
         telegram_bot_token=telegram_bot_token,
         telegram_proxy_url=telegram_proxy_url,
@@ -215,4 +234,11 @@ mode_plan_template = "/plan"
 mode_default_template = "/default"
 approve_plan_template = "Implement the plan."
 reject_plan_template = "Revise the plan with more detail, then resend it."
+
+[tmux]
+send_strategy = "keys" # keys | paste | auto
+enter_delay_ms = 100
+retry_enter_enabled = true
+retry_enter_delay_ms = 250
+retry_enter_count = 1
 """

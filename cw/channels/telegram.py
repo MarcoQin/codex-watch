@@ -16,7 +16,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from ..common import hash_binding_id, normalize_binding_id, is_valid_binding_id, utc_ts
 from ..config import Config
 from ..db import DB
-from ..tmux_client import TmuxController
+from ..tmux_client import TmuxController, TmuxSendPolicy
 
 class TelegramAPI:
     def __init__(
@@ -126,6 +126,13 @@ class TelegramService(threading.Thread):
         self.db = db
         self.stop_event = stop_event
         self.tmux = TmuxController()
+        self.tmux_send_policy = TmuxSendPolicy(
+            strategy=cfg.tmux_send_strategy,
+            enter_delay_ms=cfg.tmux_enter_delay_ms,
+            retry_enter_enabled=cfg.tmux_retry_enter_enabled,
+            retry_enter_delay_ms=cfg.tmux_retry_enter_delay_ms,
+            retry_enter_count=cfg.tmux_retry_enter_count,
+        )
         self.events_q: "queue.Queue[Dict[str, Any]]" = queue.Queue()
         self.api = TelegramAPI(
             token=cfg.telegram_bot_token,
@@ -1344,7 +1351,7 @@ class TelegramService(threading.Thread):
             return False, "tmux pane not running"
 
         try:
-            self.tmux.send_text(pane, text, enter=True)
+            self.tmux.send_text_with_policy(pane, text, self.tmux_send_policy, enter=True)
         except subprocess.CalledProcessError as e:
             return False, e.stderr.strip() or "tmux send failed"
 

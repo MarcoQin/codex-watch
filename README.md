@@ -81,6 +81,13 @@ enabled = false
 bot_token = ""
 default_channel = ""
 channel_map = {}
+
+[tmux]
+send_strategy = "keys" # keys | paste | auto
+enter_delay_ms = 100
+retry_enter_enabled = true
+retry_enter_delay_ms = 250
+retry_enter_count = 1
 ```
 
 3. Start daemon:
@@ -193,3 +200,4 @@ tail -f ~/.local/state/codex-watch/codex-watch.log
 - Control commands only work for managed sessions with active tmux panes.
 - If a pane disappears, managed session status is marked as `stopped`.
 - Telegram `update_offset` is persisted in SQLite (`kv_store`).
+- Tmux send behavior is configurable; default uses `keys` mode with delayed Enter + one retry Enter.

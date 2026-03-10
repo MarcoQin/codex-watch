@@ -41,3 +41,10 @@ mode_plan_template = "/plan"
 mode_default_template = "/default"
 approve_plan_template = "Implement the plan."
 reject_plan_template = "Revise the plan with more detail, then resend it."
+
+[tmux]
+send_strategy = "keys" # keys | paste | auto
+enter_delay_ms = 100
+retry_enter_enabled = true
+retry_enter_delay_ms = 250
+retry_enter_count = 1

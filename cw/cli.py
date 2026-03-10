@@ -225,6 +225,13 @@ def cmd_channels_status(cfg: Config) -> int:
     print(f"- default_channel: {cfg.slack_default_channel or '-'}")
     print(f"- channel_map entries: {len(cfg.slack_channel_map)}")
     print(f"- enabled: {'yes' if 'slack' in cfg.enabled_channels else 'no'}")
+
+    print("\nTmux:")
+    print(f"- send_strategy: {cfg.tmux_send_strategy}")
+    print(f"- enter_delay_ms: {cfg.tmux_enter_delay_ms}")
+    print(f"- retry_enter_enabled: {'yes' if cfg.tmux_retry_enter_enabled else 'no'}")
+    print(f"- retry_enter_delay_ms: {cfg.tmux_retry_enter_delay_ms}")
+    print(f"- retry_enter_count: {cfg.tmux_retry_enter_count}")
     return 0
 
 
