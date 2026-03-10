@@ -18,6 +18,7 @@ import sys
 import threading
 import time
 import re
+import socket
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -73,6 +74,10 @@ def format_binding_id(token: str, group_size: int = 4) -> str:
 class Config:
     bot_token: str
     poll_interval_sec: int
+    telegram_proxy_url: str
+    telegram_connect_timeout_sec: int
+    telegram_read_timeout_sec: int
+    telegram_api_base: str
     binding_id_ttl_sec: int
     sessions_root: str
     scan_interval_sec: int
@@ -105,6 +110,10 @@ def load_config(path: str) -> Config:
 
     bot_token = str(deep_get(raw, ["telegram", "bot_token"], "")).strip()
     poll_interval_sec = int(deep_get(raw, ["telegram", "poll_interval_sec"], 2))
+    telegram_proxy_url = str(deep_get(raw, ["telegram", "proxy_url"], "")).strip()
+    telegram_connect_timeout_sec = int(deep_get(raw, ["telegram", "connect_timeout_sec"], 10))
+    telegram_read_timeout_sec = int(deep_get(raw, ["telegram", "read_timeout_sec"], 30))
+    telegram_api_base = str(deep_get(raw, ["telegram", "api_base"], "https://api.telegram.org")).strip()
     binding_id_ttl_sec = int(deep_get(raw, ["auth", "binding_id_ttl_sec"], 600))
     sessions_root = os.path.expanduser(str(deep_get(raw, ["monitor", "sessions_root"], DEFAULT_SESSIONS_ROOT)))
     scan_interval_sec = int(deep_get(raw, ["monitor", "scan_interval_sec"], 2))
@@ -132,6 +141,10 @@ def load_config(path: str) -> Config:
     return Config(
         bot_token=bot_token,
         poll_interval_sec=max(1, poll_interval_sec),
+        telegram_proxy_url=telegram_proxy_url,
+        telegram_connect_timeout_sec=max(1, telegram_connect_timeout_sec),
+        telegram_read_timeout_sec=max(1, telegram_read_timeout_sec),
+        telegram_api_base=telegram_api_base or "https://api.telegram.org",
         binding_id_ttl_sec=max(60, binding_id_ttl_sec),
         sessions_root=sessions_root,
         scan_interval_sec=max(1, scan_interval_sec),
@@ -768,10 +781,51 @@ class DB:
 
 
 class TelegramAPI:
-    def __init__(self, token: str):
-        self.base = f"https://api.telegram.org/bot{token}"
+    def __init__(
+        self,
+        token: str,
+        api_base: str,
+        proxy_url: str,
+        connect_timeout_sec: int,
+        read_timeout_sec: int,
+    ):
+        normalized_api_base = self._normalize_api_base(api_base)
+        self.api_base_root = normalized_api_base
+        self.base = f"{normalized_api_base}/bot{token}"
+        self.connect_timeout_sec = max(1, int(connect_timeout_sec))
+        self.read_timeout_sec = max(1, int(read_timeout_sec))
+        self.request_timeout_sec = self.connect_timeout_sec + self.read_timeout_sec
 
-    def _call(self, method: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        self.proxy_for_log = "env/default"
+        proxy = proxy_url.strip()
+        if proxy:
+            parsed_proxy = urllib.parse.urlsplit(proxy)
+            if parsed_proxy.scheme and parsed_proxy.netloc:
+                host = parsed_proxy.hostname or parsed_proxy.netloc.rsplit("@", 1)[-1]
+                if parsed_proxy.port:
+                    host = f"{host}:{parsed_proxy.port}"
+                self.proxy_for_log = f"{parsed_proxy.scheme}://{host}"
+                handler = urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+                self.opener = urllib.request.build_opener(handler)
+            else:
+                logging.warning("invalid telegram.proxy_url=%r; fallback to direct connection", proxy)
+                self.proxy_for_log = "direct (invalid proxy_url)"
+                self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        else:
+            self.opener = urllib.request.build_opener()
+
+    def _normalize_api_base(self, value: str) -> str:
+        raw = value.strip()
+        if not raw:
+            return "https://api.telegram.org"
+        parsed = urllib.parse.urlsplit(raw)
+        if parsed.scheme in ("http", "https") and parsed.netloc:
+            base = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+            return base.rstrip("/")
+        logging.warning("invalid telegram.api_base=%r; fallback to https://api.telegram.org", value)
+        return "https://api.telegram.org"
+
+    def _call(self, method: str, payload: Dict[str, Any], request_timeout_sec: Optional[int] = None) -> Dict[str, Any]:
         data = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(
             f"{self.base}/{method}",
@@ -779,18 +833,20 @@ class TelegramAPI:
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        timeout_sec = self.request_timeout_sec if request_timeout_sec is None else max(1, int(request_timeout_sec))
+        with self.opener.open(req, timeout=timeout_sec) as resp:
             body = resp.read()
         parsed = json.loads(body.decode("utf-8"))
         if not parsed.get("ok"):
-            raise RuntimeError(f"telegram api error: {parsed}")
+            raise RuntimeError(f"telegram api error method={method}: {parsed}")
         return parsed
 
     def get_updates(self, offset: Optional[int], timeout: int) -> List[Dict[str, Any]]:
         payload: Dict[str, Any] = {"timeout": timeout}
         if offset is not None:
             payload["offset"] = offset
-        res = self._call("getUpdates", payload)
+        timeout_budget = self.connect_timeout_sec + max(0, int(timeout)) + self.read_timeout_sec
+        res = self._call("getUpdates", payload, request_timeout_sec=timeout_budget)
         return list(res.get("result", []))
 
     def send_message(self, chat_id: int, text: str, reply_markup: Optional[Dict[str, Any]] = None) -> None:
@@ -1102,12 +1158,49 @@ class SessionMonitor(threading.Thread):
         if self.db.add_dedup(dedup_key):
             self.bus.publish(event)
 
-    def _summarize_assistant_text(self, text: str, max_chars: int = 800) -> str:
-        compact = re.sub(r"\s+", " ", text).strip()
-        compact = compact.replace("<proposed_plan>", "").replace("</proposed_plan>", "").strip()
-        if len(compact) <= max_chars:
-            return compact
-        return compact[: max_chars - 1].rstrip() + "..."
+    def _split_for_limit(self, text: str, limit: int) -> Tuple[str, str]:
+        if len(text) <= limit:
+            return text, ""
+        cut = text.rfind("\n", 0, limit + 1)
+        if cut < int(limit * 0.6):
+            cut = text.rfind(" ", 0, limit + 1)
+        if cut < int(limit * 0.6):
+            cut = limit
+        head = text[:cut].rstrip()
+        tail = text[cut:].lstrip()
+        return head, tail
+
+    def _format_assistant_text_parts(
+        self,
+        text: str,
+        primary_chars: int = 700,
+        continued_chars: int = 1200,
+    ) -> Tuple[str, str]:
+        cleaned = text.replace("<proposed_plan>", "").replace("</proposed_plan>", "")
+        cleaned = cleaned.replace("\r\n", "\n").replace("\r", "\n")
+        raw_lines = [line.rstrip() for line in cleaned.split("\n")]
+        lines: List[str] = []
+        prev_blank = False
+        for line in raw_lines:
+            stripped = line.strip()
+            if not stripped:
+                if not prev_blank and lines:
+                    lines.append("")
+                prev_blank = True
+                continue
+            lines.append(stripped)
+            prev_blank = False
+        normalized = "\n".join(lines).strip()
+        if not normalized:
+            return "", ""
+
+        primary, rest = self._split_for_limit(normalized, primary_chars)
+        if not rest:
+            return primary, ""
+        continued, remainder = self._split_for_limit(rest, continued_chars)
+        if remainder:
+            continued = f"{continued.rstrip()} ..."
+        return primary, continued
 
     def _handle_line(self, file_path: str, line: str, mode: str = "live") -> None:
         text = line.strip()
@@ -1151,7 +1244,12 @@ class SessionMonitor(threading.Thread):
                         "turn_id": turn,
                     }
                     if assistant_text:
-                        event["assistant_text"] = self._summarize_assistant_text(assistant_text)
+                        primary, continued = self._format_assistant_text_parts(assistant_text)
+                        if primary:
+                            event["assistant_text_primary"] = primary
+                            event["assistant_text"] = primary
+                        if continued:
+                            event["assistant_text_continued"] = continued
                     self._emit_once(
                         dedup,
                         event,
@@ -1175,7 +1273,12 @@ class SessionMonitor(threading.Thread):
                         }
                         assistant_text = state.assistant_text_by_turn.get(turn)
                         if assistant_text:
-                            event["assistant_text"] = self._summarize_assistant_text(assistant_text)
+                            primary, continued = self._format_assistant_text_parts(assistant_text)
+                            if primary:
+                                event["assistant_text_primary"] = primary
+                                event["assistant_text"] = primary
+                            if continued:
+                                event["assistant_text_continued"] = continued
                         self.bus.publish(event)
                     state.proposed_plan_turns.discard(turn)
                 return
@@ -1253,11 +1356,25 @@ class TelegramService(threading.Thread):
         self.bus = bus
         self.stop_event = stop_event
         self.tmux = TmuxController()
-        self.api = TelegramAPI(cfg.bot_token)
+        self.api = TelegramAPI(
+            token=cfg.bot_token,
+            api_base=cfg.telegram_api_base,
+            proxy_url=cfg.telegram_proxy_url,
+            connect_timeout_sec=cfg.telegram_connect_timeout_sec,
+            read_timeout_sec=cfg.telegram_read_timeout_sec,
+        )
         self.update_offset: Optional[int] = None
 
     def run(self) -> None:
         logging.info("telegram service started")
+        logging.info(
+            "telegram network api_base=%s proxy=%s connect_timeout=%ss read_timeout=%ss request_timeout=%ss",
+            self.api.api_base_root,
+            self.api.proxy_for_log,
+            self.api.connect_timeout_sec,
+            self.api.read_timeout_sec,
+            self.api.request_timeout_sec,
+        )
         try:
             self._initialize_update_offset()
         except Exception:
@@ -1277,6 +1394,27 @@ class TelegramService(threading.Thread):
                     except Exception:
                         logging.exception("failed to handle telegram update_id=%s after offset advance", update_id)
                 self._flush_notifications(limit=20)
+            except urllib.error.HTTPError as e:
+                logging.warning(
+                    "telegram loop http error status=%s reason=%s; retry in %ss",
+                    e.code,
+                    e.reason,
+                    self.cfg.poll_interval_sec,
+                )
+                self.stop_event.wait(self.cfg.poll_interval_sec)
+            except urllib.error.URLError as e:
+                reason = str(e.reason)
+                if "timed out" in reason.lower():
+                    logging.warning("telegram loop network timeout: %s; retry in %ss", reason, self.cfg.poll_interval_sec)
+                else:
+                    logging.warning("telegram loop network error: %s; retry in %ss", reason, self.cfg.poll_interval_sec)
+                self.stop_event.wait(self.cfg.poll_interval_sec)
+            except socket.timeout as e:
+                logging.warning("telegram loop timeout: %s; retry in %ss", e, self.cfg.poll_interval_sec)
+                self.stop_event.wait(self.cfg.poll_interval_sec)
+            except TimeoutError as e:
+                logging.warning("telegram loop timeout: %s; retry in %ss", e, self.cfg.poll_interval_sec)
+                self.stop_event.wait(self.cfg.poll_interval_sec)
             except Exception:
                 logging.exception("telegram loop error")
                 self.stop_event.wait(self.cfg.poll_interval_sec)
@@ -1322,23 +1460,36 @@ class TelegramService(threading.Thread):
 
         etype = event.get("type")
         text = ""
+        continued_text = ""
         keyboard = None
 
         if etype == "task_complete":
-            text = f"[Codex] task complete\nsession: {session_label}\nturn: {event.get('turn_id', 'unknown')}"
-            assistant_text = str(event.get("assistant_text") or "").strip()
-            if assistant_text:
-                text += f"\n\nassistant:\n{assistant_text}"
+            lines = [
+                "[Codex] task complete",
+                f"session: {session_label}",
+                f"turn: {event.get('turn_id', 'unknown')}",
+            ]
+            primary = str(event.get("assistant_text_primary") or event.get("assistant_text") or "").strip()
+            continued_text = str(event.get("assistant_text_continued") or "").strip()
+            if primary:
+                lines.append("")
+                lines.append("assistant summary:")
+                lines.append(primary)
+            text = "\n".join(lines)
         elif etype == "proposed_plan_ready":
-            text = (
-                f"[Codex] plan ready for execution\n"
-                f"session: {session_label}\n"
-                f"turn: {event.get('turn_id', 'unknown')}\n"
-                f"Tap Approve Plan to auto-select this session and execute."
-            )
-            assistant_text = str(event.get("assistant_text") or "").strip()
-            if assistant_text:
-                text += f"\n\nassistant:\n{assistant_text}"
+            lines = [
+                "[Codex] plan ready for execution",
+                f"session: {session_label}",
+                f"turn: {event.get('turn_id', 'unknown')}",
+                "Tap Approve Plan to auto-select this session and execute.",
+            ]
+            primary = str(event.get("assistant_text_primary") or event.get("assistant_text") or "").strip()
+            continued_text = str(event.get("assistant_text_continued") or "").strip()
+            if primary:
+                lines.append("")
+                lines.append("assistant summary:")
+                lines.append(primary)
+            text = "\n".join(lines)
             try:
                 pending_id = int(event.get("pending_id"))
             except (TypeError, ValueError):
@@ -1365,6 +1516,8 @@ class TelegramService(threading.Thread):
         for chat_id in chats:
             try:
                 self.api.send_message(chat_id, text, reply_markup=keyboard)
+                if continued_text:
+                    self.api.send_message(chat_id, f"[Codex] assistant (continued)\n\n{continued_text}")
             except Exception:
                 logging.exception("failed to send telegram event")
 
@@ -1889,18 +2042,6 @@ class TelegramService(threading.Thread):
                 )
         else:
             lines.append("- none")
-
-        managed_sids = {str(r["codex_session_id"]) for r in managed if r["codex_session_id"]}
-        discovered = self.db.list_discovered_sessions()
-        legacy = [r for r in discovered if str(r["session_id"]) not in managed_sids]
-
-        lines.append("\nLegacy sessions (notify-only):")
-        if legacy:
-            for row in legacy[:20]:
-                lines.append(f"- {row['session_id']} | cwd={row['cwd'] or '-'}")
-        else:
-            lines.append("- none")
-
         return "\n".join(lines)
 
     def _format_selected_status(self, chat_id: int) -> str:
@@ -2016,6 +2157,10 @@ def cmd_init_config(args: argparse.Namespace) -> int:
         """[telegram]
 bot_token = ""
 poll_interval_sec = 2
+proxy_url = ""
+connect_timeout_sec = 10
+read_timeout_sec = 30
+api_base = "https://api.telegram.org"
 
 [auth]
 binding_id_ttl_sec = 600
@@ -2034,8 +2179,8 @@ log_path = "~/.local/state/codex-watch/codex-watch.log"
 pid_path = "~/.local/state/codex-watch/codex-watch.pid"
 
 [commands]
-mode_plan_template = "Please switch to Plan mode for the next response."
-mode_default_template = "Switch back to Default mode now."
+mode_plan_template = "/plan"
+mode_default_template = "/default"
 approve_plan_template = "Implement the plan."
 reject_plan_template = "Revise the plan with more detail, then resend it."
 """,
@@ -2201,6 +2346,29 @@ def cmd_daemon_status(cfg: Config) -> int:
     return 1
 
 
+def cmd_daemon_restart(args: argparse.Namespace, cfg: Config) -> int:
+    pid = read_pid(cfg.pid_path)
+    if pid and is_pid_alive(pid):
+        os.kill(pid, signal.SIGTERM)
+        print(f"sent SIGTERM to pid={pid}")
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            if not is_pid_alive(pid):
+                break
+            time.sleep(0.2)
+        if is_pid_alive(pid):
+            print(f"failed to stop daemon pid={pid} within 10s", file=sys.stderr)
+            return 1
+        remove_pid(cfg.pid_path)
+        print("daemon stopped")
+    elif pid:
+        remove_pid(cfg.pid_path)
+        print("stale pid removed")
+    else:
+        print("daemon not running, starting new daemon")
+    return cmd_daemon_start(args, cfg)
+
+
 def parse_args(argv: List[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog=APP_NAME)
     parser.add_argument("--config", default=DEFAULT_CONFIG_PATH)
@@ -2235,6 +2403,8 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     dsub.add_parser("run")
     dsub.add_parser("stop")
     dsub.add_parser("status")
+    drestart = dsub.add_parser("restart")
+    drestart.add_argument("--foreground", action="store_true")
 
     return parser.parse_args(argv)
 
@@ -2257,6 +2427,8 @@ def main(argv: List[str]) -> int:
             return cmd_daemon_stop(cfg)
         if args.daemon_cmd == "status":
             return cmd_daemon_status(cfg)
+        if args.daemon_cmd == "restart":
+            return cmd_daemon_restart(args, cfg)
         return 1
 
     db = DB(cfg.sqlite_path)

@@ -43,6 +43,10 @@ python3 -m pip install -r requirements.txt
 ```toml
 [telegram]
 bot_token = "<YOUR_TELEGRAM_BOT_TOKEN>"
+proxy_url = "http://127.0.0.1:7890"  # optional, recommended if direct Telegram access is unstable
+connect_timeout_sec = 10
+read_timeout_sec = 30
+api_base = "https://api.telegram.org"
 ```
 
 3. Start daemon:
@@ -75,6 +79,7 @@ Notes:
 
 ```bash
 ./codex-watch daemon start [--foreground]
+./codex-watch daemon restart [--foreground]
 ./codex-watch daemon stop
 ./codex-watch daemon status
 
@@ -108,6 +113,15 @@ Default:
 - SQLite: `~/.local/state/codex-watch/state.sqlite3`
 - Log: `~/.local/state/codex-watch/codex-watch.log`
 - PID: `~/.local/state/codex-watch/codex-watch.pid`
+
+## Network/Proxy Notes
+
+- If daemon restart causes Telegram to stop responding, set `[telegram].proxy_url` explicitly in config instead of relying on shell env vars.
+- Check runtime logs with:
+
+```bash
+tail -f ~/.local/state/codex-watch/codex-watch.log
+```
 
 ## Behavior Details
 
