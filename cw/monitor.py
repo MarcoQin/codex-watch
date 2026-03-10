@@ -142,6 +142,18 @@ class SessionMonitor(threading.Thread):
             )
             if alias:
                 logging.info("attached session_id %s -> alias %s", session_id, alias)
+            else:
+                if launch_nonce:
+                    logging.info(
+                        "session %s not auto-attached in strict nonce mode (launch_nonce=%s, no unique match)",
+                        session_id,
+                        launch_nonce,
+                    )
+                else:
+                    logging.info(
+                        "session %s not auto-attached in strict nonce mode (missing launch_nonce), use manual attach if needed",
+                        session_id,
+                    )
 
     def _try_attach_existing_session(self, rec: sqlite3.Row) -> None:
         session_id = rec["session_id"]

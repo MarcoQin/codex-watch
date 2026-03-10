@@ -723,7 +723,14 @@ class TelegramService(threading.Thread):
             self.api.answer_callback_query(cb_id, "Stale options, refresh from latest prompt")
             return
 
-        session_id = str(pending["session_id"])
+        session_id = str(pending["session_id"] or "")
+        resolved_session_id, resolved_managed, resolve_reason = self._resolve_pending_target_session(session_id)
+        if not resolved_session_id:
+            if resolve_reason == "non_unique_cwd":
+                self.api.answer_callback_query(cb_id, "Pending session ambiguous; use /select then retry")
+            else:
+                self.api.answer_callback_query(cb_id, "Pending session not managed; use /select then retry")
+            return
         try:
             payload = json.loads(str(pending["payload_json"]))
         except json.JSONDecodeError:
@@ -758,7 +765,7 @@ class TelegramService(threading.Thread):
 
         label = str(option.get("label", ""))
         label_send = self._clean_option_label(label)
-        ok, msg = self._send_to_session(session_id, label_send)
+        ok, msg = self._send_to_session(resolved_session_id, label_send)
         if not ok:
             self.api.answer_callback_query(cb_id, f"Failed: {msg[:80]}")
             return
@@ -792,8 +799,8 @@ class TelegramService(threading.Thread):
         pending_next = self.db.get_pending_by_id(pending_id)
         if not pending_next or str(pending_next["status"]) != "pending":
             return
-        managed = self.db.get_managed_by_session_id(session_id)
-        session_label = f"{managed['alias']} ({session_id})" if managed else session_id
+        managed = resolved_managed or self.db.get_managed_by_session_id(resolved_session_id)
+        session_label = f"{managed['alias']} ({resolved_session_id})" if managed else resolved_session_id
         text_next, keyboard_next = self._render_pending_question_message(session_label, pending_next)
         try:
             self._reply(chat_id, text_next, reply_markup=keyboard_next, rich=True)
@@ -823,13 +830,21 @@ class TelegramService(threading.Thread):
             self.api.answer_callback_query(cb_id, "Missing session id")
             return
 
-        managed = self.db.get_managed_by_session_id(session_id)
+        resolved_session_id, resolved_managed, resolve_reason = self._resolve_pending_target_session(session_id)
+        if not resolved_session_id:
+            if resolve_reason == "non_unique_cwd":
+                self.api.answer_callback_query(cb_id, "Pending session ambiguous; use /select and /approve")
+            else:
+                self.api.answer_callback_query(cb_id, "Pending session not managed; use /select and /approve")
+            return
+
+        managed = resolved_managed or self.db.get_managed_by_session_id(resolved_session_id)
         if managed:
             self.db.set_selected_session(chat_id, f"alias:{managed['alias']}")
         else:
-            self.db.set_selected_session(chat_id, f"session:{session_id}")
+            self.db.set_selected_session(chat_id, f"session:{resolved_session_id}")
 
-        ok, msg = self._send_to_session(session_id, self.cfg.approve_plan_template)
+        ok, msg = self._send_to_session(resolved_session_id, self.cfg.approve_plan_template)
         if ok:
             self.db.mark_pending_responded(pending_id)
             self.api.answer_callback_query(cb_id, "Approved")
@@ -841,6 +856,60 @@ class TelegramService(threading.Thread):
             return ""
         raw = f"{pending_id}:{payload_hash}".encode("utf-8")
         return hashlib.sha256(raw).hexdigest()[:12]
+
+    def _resolve_pending_target_session(self, pending_session_id: str) -> Tuple[Optional[str], Optional[sqlite3.Row], str]:
+        session_id = pending_session_id.strip()
+        if not session_id:
+            return None, None, "missing session id"
+
+        managed = self.db.get_managed_by_session_id(session_id)
+        if managed:
+            logging.debug(
+                "pending session resolve source=%s resolved=%s strategy=direct_managed",
+                session_id,
+                session_id,
+            )
+            return session_id, managed, "direct_managed"
+
+        discovered = self.db.get_discovered_session(session_id)
+        if not discovered:
+            logging.info("pending session unresolved source=%s reason=not_discovered", session_id)
+            return None, None, "not_discovered"
+
+        cwd = str(discovered["cwd"] or "").strip()
+        if not cwd:
+            logging.info("pending session unresolved source=%s reason=missing_cwd", session_id)
+            return None, None, "missing_cwd"
+
+        candidates = self.db.list_running_managed_by_cwd(cwd)
+        if len(candidates) != 1:
+            logging.info(
+                "pending session unresolved source=%s reason=non_unique_cwd cwd=%s candidates=%s",
+                session_id,
+                cwd,
+                len(candidates),
+            )
+            return None, None, "non_unique_cwd"
+
+        mapped = candidates[0]
+        mapped_sid = str(mapped["codex_session_id"] or "").strip()
+        if not mapped_sid:
+            logging.info(
+                "pending session unresolved source=%s reason=candidate_without_sid cwd=%s alias=%s",
+                session_id,
+                cwd,
+                str(mapped["alias"] or ""),
+            )
+            return None, None, "candidate_without_sid"
+
+        logging.info(
+            "pending session remapped source=%s resolved=%s strategy=cwd_unique_remap alias=%s cwd=%s",
+            session_id,
+            mapped_sid,
+            str(mapped["alias"] or ""),
+            cwd,
+        )
+        return mapped_sid, mapped, "cwd_unique_remap"
 
     def _handle_message(self, message: Dict[str, Any]) -> None:
         chat = message.get("chat", {}) if isinstance(message.get("chat"), dict) else {}

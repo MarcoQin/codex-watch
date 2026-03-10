@@ -245,7 +245,6 @@ class DB:
         session_ts: Optional[int],
         launch_nonce: Optional[str],
     ) -> Optional[str]:
-        now = session_ts or utc_ts()
         with self.lock:
             if launch_nonce:
                 cur = self.conn.execute(
@@ -272,42 +271,12 @@ class DB:
                         self.conn.execute(
                             "UPDATE managed_sessions SET status='awaiting_manual_attach', last_seen_at=? WHERE alias=?",
                             (utc_ts(), str(row[0])),
-                        )
+                    )
                     self.conn.commit()
                     return None
 
-            if cwd is None:
-                return None
-            cur = self.conn.execute(
-                """
-                SELECT alias FROM managed_sessions
-                WHERE codex_session_id IS NULL
-                  AND status='running'
-                  AND cwd=?
-                  AND created_at >= ?
-                ORDER BY created_at DESC
-                LIMIT 2
-                """,
-                (cwd, now - 900),
-            )
-            rows = cur.fetchall()
-            if len(rows) == 0:
-                return None
-            if len(rows) > 1:
-                for row in rows:
-                    self.conn.execute(
-                        "UPDATE managed_sessions SET status='awaiting_manual_attach', last_seen_at=? WHERE alias=?",
-                        (utc_ts(), str(row[0])),
-                    )
-                self.conn.commit()
-                return None
-            alias = str(rows[0][0])
-            self.conn.execute(
-                "UPDATE managed_sessions SET codex_session_id=?, last_seen_at=? WHERE alias=?",
-                (session_id, utc_ts(), alias),
-            )
-            self.conn.commit()
-            return alias
+            # Strict mode: auto-attach only with launch_nonce.
+            return None
 
     def get_managed_by_alias(self, alias: str) -> Optional[sqlite3.Row]:
         with self.lock:
@@ -395,6 +364,34 @@ class DB:
                 GROUP BY session_id
                 ORDER BY MAX(last_mtime) DESC
                 """
+            )
+            return cur.fetchall()
+
+    def get_discovered_session(self, session_id: str) -> Optional[sqlite3.Row]:
+        with self.lock:
+            cur = self.conn.execute(
+                """
+                SELECT session_id, MAX(cwd) AS cwd, MAX(last_mtime) AS last_mtime
+                FROM session_files
+                WHERE session_id=?
+                GROUP BY session_id
+                """,
+                (session_id,),
+            )
+            return cur.fetchone()
+
+    def list_running_managed_by_cwd(self, cwd: str) -> List[sqlite3.Row]:
+        with self.lock:
+            cur = self.conn.execute(
+                """
+                SELECT *
+                FROM managed_sessions
+                WHERE cwd=?
+                  AND status='running'
+                  AND codex_session_id IS NOT NULL
+                ORDER BY created_at DESC
+                """,
+                (cwd,),
             )
             return cur.fetchall()
 
@@ -612,4 +609,3 @@ class DB:
                 (utc_ts(), pending_id),
             )
             self.conn.commit()
-

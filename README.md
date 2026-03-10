@@ -115,7 +115,8 @@ Notes:
 
 - `--` passes remaining args to `codex`.
 - `session_id` is auto-attached after Codex writes `session_meta`.
-- Each managed launch has a `launch_nonce`; if auto-attach is ambiguous, status becomes `awaiting_manual_attach`.
+- Auto-attach is strict `launch_nonce` matching only; sessions without nonce require manual `sessions attach`.
+- If nonce matching is ambiguous, status becomes `awaiting_manual_attach`.
 
 ## CLI
 
@@ -207,6 +208,8 @@ tail -f ~/.local/state/codex-watch/codex-watch.log
 - `sessions list` shows `orphan=yes/no` and `orphan_reason` when detected.
 - `sessions rm` deletes one managed session record (refuses active records unless `--force`).
 - `sessions prune` removes orphan managed sessions in bulk (`--dry-run` to preview; running orphans require `--force`).
+- Telegram inline approve/option callbacks can auto-remap legacy pending sessions to a unique running managed session by same `cwd`.
+- Auto-attach no longer uses `cwd` fallback to avoid wrong binding when multiple sessions share the same `cwd`.
 - If a pane disappears, managed session status is marked as `stopped`.
 - Telegram `update_offset` is persisted in SQLite (`kv_store`).
 - Tmux send behavior is configurable; default uses `keys` mode with delayed Enter + one retry Enter.
