@@ -10,7 +10,7 @@ Local monitor + multi-channel bridge (Telegram + Slack) for multiple Codex sessi
   - `proposed_plan_ready` (detected by `<proposed_plan>` + round completion)
 - Supports managed sessions launched via `tmux` (`codex-watch run ...`).
 - Supports Telegram commands to interact with managed sessions:
-  - `/menu`, `/sessions`, `/select`, `/status`, `/send`, `/mode`, `/approve`, `/reject`
+  - `/menu`, `/sessions`, `/select`, `/status`, `/view`, `/send`, `/mode`, `/approve`, `/reject`
 - Supports Slack notifications (Free workspace compatible) via `chat.postMessage`:
   - `task_complete`
   - `request_user_input`
@@ -88,6 +88,7 @@ enter_delay_ms = 100
 retry_enter_enabled = true
 retry_enter_delay_ms = 250
 retry_enter_count = 1
+view_lines = 80
 ```
 
 3. Start daemon:
@@ -142,6 +143,7 @@ Notes:
 - `/sessions`
 - `/select <alias|session_id>`
 - `/status`
+- `/view`
 - `/send <text>`
 - `/mode <plan>`
 - `/approve`
@@ -149,6 +151,7 @@ Notes:
 
 `request_user_input` events include inline buttons and option descriptions in the message body.
 `/sessions` returns clickable paged buttons for fast selection.
+/view sends a tmux text snapshot with inline controls: `↑ ↓ ← → Enter` + `Refresh`.
 Any non-command text is forwarded to the currently selected managed session.
 Image/file messages are not supported yet; the bot prompts you to send text or an image link with context.
 
@@ -201,3 +204,4 @@ tail -f ~/.local/state/codex-watch/codex-watch.log
 - If a pane disappears, managed session status is marked as `stopped`.
 - Telegram `update_offset` is persisted in SQLite (`kv_store`).
 - Tmux send behavior is configurable; default uses `keys` mode with delayed Enter + one retry Enter.
+- Tmux view uses text snapshot (manual refresh only, no auto-refresh).

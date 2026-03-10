@@ -37,6 +37,14 @@ class TmuxController:
         except subprocess.CalledProcessError:
             return False
 
+    def capture_pane_text(self, pane_id: str, lines: int = 80) -> str:
+        tail_lines = max(1, int(lines))
+        result = self._run_tmux(["capture-pane", "-p", "-J", "-t", pane_id, "-S", f"-{tail_lines}", "-E", "-"])
+        return result.stdout
+
+    def send_special_key(self, pane_id: str, key: str) -> None:
+        self._run_tmux(["send-keys", "-t", pane_id, key])
+
     def _send_via_paste(self, pane_id: str, text: str) -> None:
         self._run_tmux(["set-buffer", "--", text])
         self._run_tmux(["paste-buffer", "-t", pane_id])

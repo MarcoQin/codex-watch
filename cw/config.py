@@ -36,6 +36,7 @@ class Config:
     tmux_retry_enter_enabled: bool
     tmux_retry_enter_delay_ms: int
     tmux_retry_enter_count: int
+    tmux_view_lines: int
 
     enabled_channels: List[str]
 
@@ -152,6 +153,7 @@ def load_config(path: str) -> Config:
     tmux_retry_enter_delay_ms = int(deep_get(raw, ["tmux", "retry_enter_delay_ms"], 250))
     tmux_retry_enter_count = int(deep_get(raw, ["tmux", "retry_enter_count"], 1))
     tmux_retry_enter_count = 1 if tmux_retry_enter_count > 0 else 0
+    tmux_view_lines = int(deep_get(raw, ["tmux", "view_lines"], 80))
 
     return Config(
         poll_interval_sec=max(1, poll_interval_sec),
@@ -172,6 +174,7 @@ def load_config(path: str) -> Config:
         tmux_retry_enter_enabled=tmux_retry_enter_enabled,
         tmux_retry_enter_delay_ms=max(0, tmux_retry_enter_delay_ms),
         tmux_retry_enter_count=tmux_retry_enter_count,
+        tmux_view_lines=max(20, min(400, tmux_view_lines)),
         enabled_channels=enabled_channels,
         telegram_bot_token=telegram_bot_token,
         telegram_proxy_url=telegram_proxy_url,
@@ -241,4 +244,5 @@ enter_delay_ms = 100
 retry_enter_enabled = true
 retry_enter_delay_ms = 250
 retry_enter_count = 1
+view_lines = 80
 """

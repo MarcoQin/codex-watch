@@ -231,6 +231,7 @@ class TelegramService(threading.Thread):
             {"command": "sessions", "description": "List/select managed sessions"},
             {"command": "select", "description": "Select a managed session"},
             {"command": "status", "description": "Show selected session status"},
+            {"command": "view", "description": "View tmux screen + controls"},
             {"command": "mode", "description": "Switch mode: /mode plan"},
             {"command": "approve", "description": "Approve pending action"},
             {"command": "reject", "description": "Reject pending action"},
@@ -247,8 +248,8 @@ class TelegramService(threading.Thread):
     def _main_menu_keyboard(self) -> Dict[str, Any]:
         return {
             "keyboard": [
-                [{"text": "Sessions"}, {"text": "Select"}, {"text": "Status"}, {"text": "Help"}],
-                [{"text": "Plan"}, {"text": "Approve"}, {"text": "Reject"}],
+                [{"text": "Sessions"}, {"text": "Select"}, {"text": "Status"}, {"text": "View"}],
+                [{"text": "Help"}, {"text": "Plan"}, {"text": "Approve"}, {"text": "Reject"}],
             ],
             "resize_keyboard": True,
             "is_persistent": True,
@@ -263,6 +264,7 @@ class TelegramService(threading.Thread):
             "Sessions": "/sessions",
             "Select": "/select",
             "Status": "/status",
+            "View": "/view",
             "Help": "/help",
             "Menu": "/menu",
             "Plan": "/mode plan",
@@ -376,6 +378,129 @@ class TelegramService(threading.Thread):
                 reply_markup=self._main_menu_keyboard(),
                 rich=True,
             )
+            return
+
+        self.api.answer_callback_query(cb_id, "Unsupported callback")
+
+    @staticmethod
+    def _sanitize_tmux_capture(text: str) -> str:
+        normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+        normalized = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]", "", normalized)
+        normalized = normalized.rstrip("\n")
+        return normalized if normalized else "(empty pane output)"
+
+    @staticmethod
+    def _tmux_key_from_code(code: str) -> Optional[str]:
+        mapping = {
+            "U": "Up",
+            "D": "Down",
+            "L": "Left",
+            "R": "Right",
+            "E": "C-m",
+        }
+        return mapping.get(code.upper())
+
+    def _tmux_view_keyboard(self, session_id: str) -> Dict[str, Any]:
+        sid = session_id[:48]
+        return {
+            "inline_keyboard": [
+                [{"text": "↑", "callback_data": f"tv|k|{sid}|U"[:64]}],
+                [
+                    {"text": "←", "callback_data": f"tv|k|{sid}|L"[:64]},
+                    {"text": "↓", "callback_data": f"tv|k|{sid}|D"[:64]},
+                    {"text": "→", "callback_data": f"tv|k|{sid}|R"[:64]},
+                ],
+                [
+                    {"text": "Enter", "callback_data": f"tv|k|{sid}|E"[:64]},
+                    {"text": "Refresh", "callback_data": f"tv|v|{sid}"[:64]},
+                ],
+            ]
+        }
+
+    def _resolve_view_target_by_session_id(self, session_id: str) -> Tuple[Optional[sqlite3.Row], str]:
+        sid = session_id.strip()
+        if not sid:
+            return None, "missing session id"
+        row = self.db.get_managed_by_session_id(sid)
+        if not row:
+            return None, "session is not managed"
+        pane = str(row["tmux_pane"] or "").strip()
+        if not pane:
+            return None, "missing tmux pane"
+        if not self.tmux.pane_exists(pane):
+            self.db.update_managed_status_by_alias(str(row["alias"]), "stopped")
+            return None, "tmux pane not running"
+        return row, "ok"
+
+    def _resolve_view_target_from_chat(self, chat_id: int) -> Tuple[Optional[sqlite3.Row], str]:
+        session_id = self._selected_session_id(chat_id)
+        if not session_id:
+            return None, "No selected managed session. Use /sessions."
+        if session_id.startswith("alias::"):
+            alias = session_id.split("::", 1)[1]
+            return None, f"Selected alias {alias} is waiting for codex_session_id."
+        row, msg = self._resolve_view_target_by_session_id(session_id)
+        if not row:
+            if msg == "session is not managed":
+                return None, "Selected session is legacy (notify-only). Use /sessions."
+            return None, msg
+        return row, "ok"
+
+    def _render_tmux_view(self, row: sqlite3.Row) -> Tuple[str, Dict[str, Any]]:
+        session_id = str(row["codex_session_id"] or "")
+        pane = str(row["tmux_pane"] or "")
+        alias = str(row["alias"] or "")
+        captured = self.tmux.capture_pane_text(pane, self.cfg.tmux_view_lines)
+        safe_capture = self._sanitize_tmux_capture(captured)
+        lines = [
+            "<b>[Codex] tmux view</b>",
+            self._kv_html("session", f"{alias} ({session_id})"),
+            self._kv_html("pane", pane, code=True),
+            self._kv_html("lines", self.cfg.tmux_view_lines),
+            "",
+            f"<pre><code>{self._h(safe_capture)}</code></pre>",
+        ]
+        return "\n".join(lines), self._tmux_view_keyboard(session_id)
+
+    def _handle_tmux_view_callback(self, cb_id: str, chat_id: int, parts: List[str]) -> None:
+        if len(parts) < 3:
+            self.api.answer_callback_query(cb_id, "Invalid callback data")
+            return
+
+        action = parts[1]
+        session_id = parts[2]
+        row, msg = self._resolve_view_target_by_session_id(session_id)
+        if not row:
+            self.api.answer_callback_query(cb_id, msg[:80])
+            return
+
+        if action == "v":
+            try:
+                text, keyboard = self._render_tmux_view(row)
+            except subprocess.CalledProcessError as e:
+                self.api.answer_callback_query(
+                    cb_id,
+                    f"Failed: {(e.stderr.strip() or 'tmux capture failed')[:80]}",
+                )
+                return
+            self._reply(chat_id, text, reply_markup=keyboard, rich=True)
+            self.api.answer_callback_query(cb_id, "Refreshed")
+            return
+
+        if action == "k":
+            if len(parts) != 4:
+                self.api.answer_callback_query(cb_id, "Invalid callback data")
+                return
+            key = self._tmux_key_from_code(parts[3])
+            if not key:
+                self.api.answer_callback_query(cb_id, "Unsupported key")
+                return
+            try:
+                self.tmux.send_special_key(str(row["tmux_pane"]), key)
+            except subprocess.CalledProcessError as e:
+                self.api.answer_callback_query(cb_id, f"Failed: {(e.stderr.strip() or 'tmux send failed')[:80]}")
+                return
+            self.api.answer_callback_query(cb_id, "Sent")
             return
 
         self.api.answer_callback_query(cb_id, "Unsupported callback")
@@ -565,6 +690,10 @@ class TelegramService(threading.Thread):
             self._handle_sessions_callback(cb_id, chat_id, parts)
             return
 
+        if parts and parts[0] == "tv":
+            self._handle_tmux_view_callback(cb_id, chat_id, parts)
+            return
+
         if len(parts) != 5 or parts[0] != "pick":
             self.api.answer_callback_query(cb_id, "Unsupported callback")
             return
@@ -749,6 +878,7 @@ class TelegramService(threading.Thread):
                 "<code>/sessions</code>\n"
                 "<code>/select &lt;alias|session_id&gt;</code>\n"
                 "<code>/status</code>\n"
+                "<code>/view</code>\n"
                 "<code>/send &lt;text&gt;</code>\n"
                 "<code>/mode &lt;plan&gt;</code>\n"
                 "<code>/approve</code>\n"
@@ -816,6 +946,19 @@ class TelegramService(threading.Thread):
 
         if cmd == "/status":
             self._reply(chat_id, self._format_selected_status_html(chat_id), rich=True)
+            return
+
+        if cmd == "/view":
+            row, msg = self._resolve_view_target_from_chat(chat_id)
+            if not row:
+                self._reply(chat_id, msg)
+                return
+            try:
+                text_view, keyboard_view = self._render_tmux_view(row)
+            except subprocess.CalledProcessError as e:
+                self._reply(chat_id, f"View failed: {e.stderr.strip() or 'tmux capture failed'}")
+                return
+            self._reply(chat_id, text_view, reply_markup=keyboard_view, rich=True)
             return
 
         if cmd == "/send":

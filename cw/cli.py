@@ -232,6 +232,7 @@ def cmd_channels_status(cfg: Config) -> int:
     print(f"- retry_enter_enabled: {'yes' if cfg.tmux_retry_enter_enabled else 'no'}")
     print(f"- retry_enter_delay_ms: {cfg.tmux_retry_enter_delay_ms}")
     print(f"- retry_enter_count: {cfg.tmux_retry_enter_count}")
+    print(f"- view_lines: {cfg.tmux_view_lines}")
     return 0
 
 
