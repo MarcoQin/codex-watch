@@ -8,6 +8,7 @@ import socket
 import sqlite3
 import subprocess
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -249,7 +250,7 @@ class TelegramService(threading.Thread):
         return {
             "keyboard": [
                 [{"text": "Sessions"}, {"text": "Select"}, {"text": "Status"}, {"text": "View"}],
-                [{"text": "Help"}, {"text": "Plan"}, {"text": "Approve"}, {"text": "Reject"}],
+                [{"text": "Help"}, {"text": "Plan"}],
             ],
             "resize_keyboard": True,
             "is_persistent": True,
@@ -270,6 +271,7 @@ class TelegramService(threading.Thread):
             "Plan": "/mode plan",
             # Keep compatibility with stale keyboards that still show "Default".
             "Default": "/mode default",
+            # Keep compatibility with stale keyboards that still show "Approve/Reject".
             "Approve": "/approve",
             "Reject": "/reject",
         }
@@ -550,7 +552,7 @@ class TelegramService(threading.Thread):
                 "<b>[Codex] plan ready for execution</b>",
                 self._kv_html("session", session_label),
                 self._kv_html("turn", event.get("turn_id", "unknown")),
-                "Tap <b>Approve Plan</b> to auto-select this session and execute.",
+                "Tap <b>Approve Plan</b> or <b>Reject Plan</b> to auto-select this session and execute.",
             ]
             primary = str(event.get("assistant_text_primary") or event.get("assistant_text") or "").strip()
             continued_text = str(event.get("assistant_text_continued") or "").strip()
@@ -567,8 +569,14 @@ class TelegramService(threading.Thread):
             payload_hash = str(event.get("payload_hash") or "")
             callback_token = self._build_pending_callback_token(pending_id, payload_hash)
             if pending_id > 0 and callback_token:
-                cb = f"appr|{pending_id}|{callback_token}"
-                keyboard = {"inline_keyboard": [[{"text": "Approve Plan", "callback_data": cb[:64]}]]}
+                cb_approve = f"appr|{pending_id}|{callback_token}"
+                cb_reject = f"rjct|{pending_id}|{callback_token}"
+                keyboard = {
+                    "inline_keyboard": [
+                        [{"text": "Approve Plan", "callback_data": cb_approve[:64]}],
+                        [{"text": "Reject Plan", "callback_data": cb_reject[:64]}],
+                    ]
+                }
         elif etype == "request_user_input":
             pending: Optional[sqlite3.Row] = None
             try:
@@ -676,7 +684,7 @@ class TelegramService(threading.Thread):
             return
 
         parts = data.split("|")
-        if parts and parts[0] == "appr":
+        if parts and parts[0] in ("appr", "rjct"):
             if len(parts) != 3:
                 self.api.answer_callback_query(cb_id, "Invalid callback data")
                 return
@@ -686,7 +694,13 @@ class TelegramService(threading.Thread):
                 self.api.answer_callback_query(cb_id, "Invalid callback data")
                 return
             callback_token = str(parts[2]).strip().lower()
-            self._handle_approve_plan_callback(cb_id, chat_id, pending_id, callback_token)
+            self._handle_plan_decision_callback(
+                cb_id,
+                chat_id,
+                pending_id,
+                callback_token,
+                approve=(parts[0] == "appr"),
+            )
             return
 
         if parts and parts[0] == "sl":
@@ -807,7 +821,14 @@ class TelegramService(threading.Thread):
         except Exception:
             logging.exception("failed to send next request_user_input question pending_id=%s next_idx=%s", pending_id, next_idx)
 
-    def _handle_approve_plan_callback(self, cb_id: str, chat_id: int, pending_id: int, callback_token: str) -> None:
+    def _handle_plan_decision_callback(
+        self,
+        cb_id: str,
+        chat_id: int,
+        pending_id: int,
+        callback_token: str,
+        approve: bool,
+    ) -> None:
         pending = self.db.get_pending_by_id(pending_id)
         if not pending or str(pending["status"]) != "pending":
             self.api.answer_callback_query(cb_id, "Already handled")
@@ -833,9 +854,9 @@ class TelegramService(threading.Thread):
         resolved_session_id, resolved_managed, resolve_reason = self._resolve_pending_target_session(session_id)
         if not resolved_session_id:
             if resolve_reason == "non_unique_cwd":
-                self.api.answer_callback_query(cb_id, "Pending session ambiguous; use /select and /approve")
+                self.api.answer_callback_query(cb_id, "Pending session ambiguous; use /select then retry")
             else:
-                self.api.answer_callback_query(cb_id, "Pending session not managed; use /select and /approve")
+                self.api.answer_callback_query(cb_id, "Pending session not managed; use /select then retry")
             return
 
         managed = resolved_managed or self.db.get_managed_by_session_id(resolved_session_id)
@@ -844,10 +865,10 @@ class TelegramService(threading.Thread):
         else:
             self.db.set_selected_session(chat_id, f"session:{resolved_session_id}")
 
-        ok, msg = self._send_to_session(resolved_session_id, self.cfg.approve_plan_template)
+        ok, msg = self._send_plan_decision_keys(resolved_session_id, approve=approve)
         if ok:
             self.db.mark_pending_responded(pending_id)
-            self.api.answer_callback_query(cb_id, "Approved")
+            self.api.answer_callback_query(cb_id, "Approved" if approve else "Rejected")
             return
         self.api.answer_callback_query(cb_id, f"Failed: {msg[:80]}")
 
@@ -1147,14 +1168,45 @@ class TelegramService(threading.Thread):
                 return True, "ok"
 
             if kind == "proposed_plan":
-                send_text = self.cfg.approve_plan_template if approve else self.cfg.reject_plan_template
-                ok, msg = self._send_to_session(session_id, send_text)
+                ok, msg = self._send_plan_decision_keys(session_id, approve=approve)
                 if ok:
                     self.db.mark_pending_responded(int(first["id"]))
                 return ok, msg
 
-        fallback = self.cfg.approve_plan_template if approve else self.cfg.reject_plan_template
-        return self._send_to_session(session_id, fallback)
+            return False, f"unsupported pending kind: {kind}"
+
+        return False, "no pending action for selected session"
+
+    def _send_plan_decision_keys(self, session_id: str, approve: bool) -> Tuple[bool, str]:
+        alias_hint = None
+        if session_id.startswith("alias::"):
+            alias_hint = session_id.split("::", 1)[1]
+
+        row = self.db.get_managed_by_session_id(session_id) if alias_hint is None else self.db.get_managed_by_alias(alias_hint)
+        if not row:
+            return False, "session is not managed (legacy session is notify-only)"
+        tmux_session = str(row["tmux_session"] or "").strip()
+        pane = str(row["tmux_pane"] or "").strip()
+        if not tmux_session:
+            return False, "missing tmux session"
+        if not pane:
+            return False, "missing tmux pane"
+        if (not self.tmux.session_exists(tmux_session)) or (not self.tmux.pane_belongs_to_session(tmux_session, pane)):
+            self.db.update_managed_status_by_alias(str(row["alias"]), "stopped")
+            return False, "tmux session/pane not running"
+
+        try:
+            if approve:
+                self.tmux.send_special_key(pane, "C-m")
+            else:
+                self.tmux.send_special_key(pane, "Down")
+                delay_ms = max(0, int(self.tmux_send_policy.enter_delay_ms))
+                if delay_ms > 0:
+                    time.sleep(delay_ms / 1000.0)
+                self.tmux.send_special_key(pane, "C-m")
+        except subprocess.CalledProcessError as e:
+            return False, e.stderr.strip() or "tmux send failed"
+        return True, "ok"
 
     def _split_command(self, text: str) -> Tuple[str, str]:
         parts = text.split(maxsplit=1)
