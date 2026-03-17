@@ -234,6 +234,7 @@ class TelegramService(threading.Thread):
             {"command": "status", "description": "Show selected session status"},
             {"command": "view", "description": "View tmux screen + controls"},
             {"command": "mode", "description": "Switch mode: /mode plan"},
+            {"command": "clear", "description": "Send /clear to selected session"},
             {"command": "approve", "description": "Approve pending action"},
             {"command": "reject", "description": "Reject pending action"},
             {"command": "send", "description": "Send text to selected session"},
@@ -250,7 +251,7 @@ class TelegramService(threading.Thread):
         return {
             "keyboard": [
                 [{"text": "Sessions"}, {"text": "Select"}, {"text": "Status"}, {"text": "View"}],
-                [{"text": "Help"}, {"text": "Plan"}],
+                [{"text": "Help"}, {"text": "Plan"}, {"text": "Clear"}],
             ],
             "resize_keyboard": True,
             "is_persistent": True,
@@ -269,6 +270,7 @@ class TelegramService(threading.Thread):
             "Help": "/help",
             "Menu": "/menu",
             "Plan": "/mode plan",
+            "Clear": "/clear",
             # Keep compatibility with stale keyboards that still show "Default".
             "Default": "/mode default",
             # Keep compatibility with stale keyboards that still show "Approve/Reject".
@@ -539,7 +541,7 @@ class TelegramService(threading.Thread):
                 self._kv_html("session", session_label),
                 self._kv_html("turn", event.get("turn_id", "unknown")),
             ]
-            primary = str(event.get("assistant_text_primary") or event.get("assistant_text") or "").strip()
+            primary = str(event.get("assistant_text") or event.get("assistant_text_primary") or "").strip()
             continued_text = str(event.get("assistant_text_continued") or "").strip()
             if primary:
                 lines.append("")
@@ -554,7 +556,7 @@ class TelegramService(threading.Thread):
                 self._kv_html("turn", event.get("turn_id", "unknown")),
                 "Tap <b>Approve Plan</b> or <b>Reject Plan</b> to auto-select this session and execute.",
             ]
-            primary = str(event.get("assistant_text_primary") or event.get("assistant_text") or "").strip()
+            primary = str(event.get("assistant_text") or event.get("assistant_text_primary") or "").strip()
             continued_text = str(event.get("assistant_text_continued") or "").strip()
             if primary:
                 lines.append("")
@@ -974,6 +976,7 @@ class TelegramService(threading.Thread):
                 "<code>/view</code>\n"
                 "<code>/send &lt;text&gt;</code>\n"
                 "<code>/mode &lt;plan&gt;</code>\n"
+                "<code>/clear</code>\n"
                 "<code>/approve</code>\n"
                 "<code>/reject</code>\n\n"
                 "<i>Tip: plain text (without leading /) is sent to the selected managed session.</i>",
@@ -1084,6 +1087,15 @@ class TelegramService(threading.Thread):
                 return
             ok, msg = self._send_to_session(session_id, text_to_send)
             self._reply(chat_id, "Mode command sent." if ok else f"Failed: {msg}")
+            return
+
+        if cmd == "/clear":
+            session_id = self._selected_session_id(chat_id)
+            if not session_id:
+                self._reply(chat_id, "No selected managed session. Use /sessions.")
+                return
+            ok, msg = self._send_to_session(session_id, "/clear")
+            self._reply(chat_id, "Sent." if ok else f"Failed: {msg}")
             return
 
         if cmd in ("/approve", "/reject"):

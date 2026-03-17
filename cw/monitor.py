@@ -303,23 +303,9 @@ class SessionMonitor(threading.Thread):
         if self.db.add_dedup(dedup_key):
             self.bus.publish(event)
 
-    def _split_for_limit(self, text: str, limit: int) -> Tuple[str, str]:
-        if len(text) <= limit:
-            return text, ""
-        cut = text.rfind("\n", 0, limit + 1)
-        if cut < int(limit * 0.6):
-            cut = text.rfind(" ", 0, limit + 1)
-        if cut < int(limit * 0.6):
-            cut = limit
-        head = text[:cut].rstrip()
-        tail = text[cut:].lstrip()
-        return head, tail
-
     def _format_assistant_text_parts(
         self,
         text: str,
-        primary_chars: int = 700,
-        continued_chars: int = 1200,
     ) -> Tuple[str, str]:
         cleaned = text.replace("<proposed_plan>", "").replace("</proposed_plan>", "")
         cleaned = cleaned.replace("\r\n", "\n").replace("\r", "\n")
@@ -338,14 +324,8 @@ class SessionMonitor(threading.Thread):
         normalized = "\n".join(lines).strip()
         if not normalized:
             return "", ""
-
-        primary, rest = self._split_for_limit(normalized, primary_chars)
-        if not rest:
-            return primary, ""
-        continued, remainder = self._split_for_limit(rest, continued_chars)
-        if remainder:
-            continued = f"{continued.rstrip()} ..."
-        return primary, continued
+        # Keep full assistant text; Telegram side handles chunk splitting.
+        return normalized, ""
 
     def _handle_line(self, file_path: str, line: str, mode: str = "live") -> None:
         text = line.strip()

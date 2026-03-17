@@ -10,7 +10,7 @@ Local monitor + multi-channel bridge (Telegram + Slack) for multiple Codex sessi
   - `proposed_plan_ready` (detected by `<proposed_plan>` + round completion)
 - Supports managed sessions launched via `tmux` (`codex-watch run ...`).
 - Supports Telegram commands to interact with managed sessions:
-  - `/menu`, `/sessions`, `/select`, `/status`, `/view`, `/send`, `/mode`, `/approve`, `/reject`
+  - `/menu`, `/sessions`, `/select`, `/status`, `/view`, `/send`, `/mode`, `/clear`, `/approve`, `/reject`
 - Supports Slack notifications (Free workspace compatible) via `chat.postMessage`:
   - `task_complete`
   - `request_user_input`
@@ -21,6 +21,7 @@ Local monitor + multi-channel bridge (Telegram + Slack) for multiple Codex sessi
 - Telegram command menu (`/` autocomplete) is registered automatically on startup.
 - Core notifications and command replies use Telegram HTML rendering for better readability.
 - Long Telegram messages are auto-split safely (with HTML-aware chunking + plain-text fallback).
+- `task_complete` and `proposed_plan_ready` assistant text are forwarded in full (no monitor-side truncation).
 - Assistant Markdown in Telegram notifications is auto-rendered (common syntax subset).
 - Multi-channel event fan-out: one monitor event can be delivered to Telegram and Slack at the same time.
 - `/sessions` and `/select` support inline clickable managed-session picker with pagination.
@@ -149,6 +150,7 @@ Notes:
 - `/view`
 - `/send <text>`
 - `/mode <plan>`
+- `/clear`
 - `/approve`
 - `/reject`
 
@@ -158,7 +160,8 @@ Notes:
 Any non-command text is forwarded to the currently selected managed session.
 Image/file messages are not supported yet; the bot prompts you to send text or an image link with context.
 For `proposed_plan_ready`, `/approve` sends `Enter`; `/reject` sends `Down` then delayed `Enter`.
-Main menu keeps quick buttons for `Sessions/Select/Status/View/Help/Plan`; `Approve/Reject` are command or inline-plan buttons only.
+`/clear` sends `/clear` to the selected session using the configured delayed Enter tmux policy.
+Main menu keeps quick buttons for `Sessions/Select/Status/View/Help/Plan/Clear`; `Approve/Reject` are command or inline-plan buttons only.
 
 ## Slack Setup (Free)
 
