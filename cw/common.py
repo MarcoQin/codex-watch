@@ -5,6 +5,7 @@ import os
 import random
 import re
 import signal
+import sys
 import time
 from pathlib import Path
 from typing import Any, List, Optional
@@ -55,10 +56,27 @@ def ensure_parent_dir(path: str) -> None:
 def setup_logging(log_path: str, verbose: bool = False) -> None:
     ensure_parent_dir(log_path)
     level = logging.DEBUG if verbose else logging.INFO
-    handlers: List[logging.Handler] = [
-        logging.FileHandler(log_path, encoding="utf-8"),
-        logging.StreamHandler(),
-    ]
+
+    file_handler = logging.FileHandler(log_path, encoding="utf-8")
+    handlers: List[logging.Handler] = [file_handler]
+    include_stream = True
+    try:
+        stream_stat = os.fstat(sys.stderr.fileno())
+        file_stat = os.fstat(file_handler.stream.fileno())
+        if stream_stat.st_dev == file_stat.st_dev and stream_stat.st_ino == file_stat.st_ino:
+            include_stream = False
+    except Exception:
+        include_stream = True
+    if include_stream:
+        handlers.append(logging.StreamHandler())
+
+    root_logger = logging.getLogger()
+    for h in list(root_logger.handlers):
+        root_logger.removeHandler(h)
+        try:
+            h.close()
+        except Exception:
+            pass
     logging.basicConfig(
         level=level,
         format="%(asctime)s [%(levelname)s] %(message)s",

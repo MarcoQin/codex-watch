@@ -22,6 +22,13 @@ class Config:
     sessions_root: str
     scan_interval_sec: int
     backfill_lines: int
+    monitor_watch_enabled: bool
+    monitor_watch_fallback_scan_interval_sec: int
+    monitor_watch_debounce_ms: int
+    monitor_watch_max_batch_events: int
+    monitor_watch_legacy_attach_log_cooldown_sec: int
+    monitor_watch_latency_log_enabled: bool
+    monitor_watch_latency_warn_ms: int
     enabled_triggers: List[str]
     sqlite_path: str
     log_path: str
@@ -128,6 +135,17 @@ def load_config(path: str) -> Config:
     sessions_root = os.path.expanduser(str(deep_get(raw, ["monitor", "sessions_root"], DEFAULT_SESSIONS_ROOT)))
     scan_interval_sec = int(deep_get(raw, ["monitor", "scan_interval_sec"], 2))
     backfill_lines = int(deep_get(raw, ["monitor", "backfill_lines"], 3000))
+    monitor_watch_enabled = bool(deep_get(raw, ["monitor", "watch", "enabled"], True))
+    monitor_watch_fallback_scan_interval_sec = int(
+        deep_get(raw, ["monitor", "watch", "fallback_scan_interval_sec"], 30)
+    )
+    monitor_watch_debounce_ms = int(deep_get(raw, ["monitor", "watch", "debounce_ms"], 150))
+    monitor_watch_max_batch_events = int(deep_get(raw, ["monitor", "watch", "max_batch_events"], 200))
+    monitor_watch_legacy_attach_log_cooldown_sec = int(
+        deep_get(raw, ["monitor", "watch", "legacy_attach_log_cooldown_sec"], 1800)
+    )
+    monitor_watch_latency_log_enabled = bool(deep_get(raw, ["monitor", "watch", "latency_log_enabled"], True))
+    monitor_watch_latency_warn_ms = int(deep_get(raw, ["monitor", "watch", "latency_warn_ms"], 1500))
     enabled_triggers = list(
         deep_get(
             raw,
@@ -161,6 +179,13 @@ def load_config(path: str) -> Config:
         sessions_root=sessions_root,
         scan_interval_sec=max(1, scan_interval_sec),
         backfill_lines=max(0, backfill_lines),
+        monitor_watch_enabled=monitor_watch_enabled,
+        monitor_watch_fallback_scan_interval_sec=max(5, monitor_watch_fallback_scan_interval_sec),
+        monitor_watch_debounce_ms=max(0, monitor_watch_debounce_ms),
+        monitor_watch_max_batch_events=max(10, monitor_watch_max_batch_events),
+        monitor_watch_legacy_attach_log_cooldown_sec=max(30, monitor_watch_legacy_attach_log_cooldown_sec),
+        monitor_watch_latency_log_enabled=monitor_watch_latency_log_enabled,
+        monitor_watch_latency_warn_ms=max(100, monitor_watch_latency_warn_ms),
         enabled_triggers=enabled_triggers,
         sqlite_path=sqlite_path,
         log_path=log_path,
@@ -223,6 +248,15 @@ binding_id_ttl_sec = 600
 sessions_root = "~/.codex/sessions"
 scan_interval_sec = 2
 backfill_lines = 3000
+
+[monitor.watch]
+enabled = true
+fallback_scan_interval_sec = 30
+debounce_ms = 150
+max_batch_events = 200
+legacy_attach_log_cooldown_sec = 1800
+latency_log_enabled = true
+latency_warn_ms = 1500
 
 [notify]
 enabled_triggers = ["task_complete", "request_user_input", "proposed_plan_ready"]

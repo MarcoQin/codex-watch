@@ -143,6 +143,8 @@ class TelegramService(threading.Thread):
             read_timeout_sec=cfg.telegram_read_timeout_sec,
         )
         self.update_offset: Optional[int] = None
+        self.latency_log_enabled = cfg.monitor_watch_latency_log_enabled
+        self.latency_warn_ms = cfg.monitor_watch_latency_warn_ms
 
     def publish_event(self, event: Dict[str, Any]) -> None:
         self.events_q.put(event)
@@ -565,6 +567,19 @@ class TelegramService(threading.Thread):
         chats = self.db.list_bound_chats()
         if not chats:
             return
+        broadcast_start_ms = int(time.time() * 1000)
+        monitor_line_seen_ms_raw = event.get("_monitor_line_seen_at_ms")
+        monitor_emitted_ms_raw = event.get("_monitor_emitted_at_ms")
+        monitor_source = str(event.get("_monitor_source") or "unknown")
+        dedup_key = str(event.get("_monitor_dedup_key") or "")
+        try:
+            monitor_line_seen_ms = int(monitor_line_seen_ms_raw) if monitor_line_seen_ms_raw is not None else -1
+        except (TypeError, ValueError):
+            monitor_line_seen_ms = -1
+        try:
+            monitor_emitted_ms = int(monitor_emitted_ms_raw) if monitor_emitted_ms_raw is not None else -1
+        except (TypeError, ValueError):
+            monitor_emitted_ms = -1
 
         session_id = str(event.get("session_id", ""))
         managed = self.db.get_managed_by_session_id(session_id)
@@ -579,6 +594,8 @@ class TelegramService(threading.Thread):
         continued_text = ""
         keyboard = None
         rich = False
+        total_api_ms = 0
+        successful_chats = 0
 
         if etype == "task_complete":
             lines = [
@@ -645,6 +662,7 @@ class TelegramService(threading.Thread):
 
         for chat_id in target_chats:
             try:
+                send_started_ms = int(time.time() * 1000)
                 self._reply(chat_id, text, reply_markup=keyboard, rich=rich)
                 if continued_text:
                     self._reply(
@@ -652,8 +670,34 @@ class TelegramService(threading.Thread):
                         f"<b>[Codex] assistant (continued)</b>\n\n{self._render_assistant_text_html(continued_text)}",
                         rich=True,
                     )
+                total_api_ms += max(0, int(time.time() * 1000) - send_started_ms)
+                successful_chats += 1
             except Exception:
                 logging.exception("failed to send telegram event")
+
+        if self.latency_log_enabled:
+            finished_ms = int(time.time() * 1000)
+            monitor_to_tg_ms = (broadcast_start_ms - monitor_emitted_ms) if monitor_emitted_ms > 0 else -1
+            end_to_end_ms = (finished_ms - monitor_line_seen_ms) if monitor_line_seen_ms > 0 else -1
+            warning = (
+                (monitor_to_tg_ms >= self.latency_warn_ms if monitor_to_tg_ms >= 0 else False)
+                or (end_to_end_ms >= self.latency_warn_ms if end_to_end_ms >= 0 else False)
+            )
+            log_level = logging.WARNING if warning else logging.DEBUG
+            logging.log(
+                log_level,
+                "event latency type=%s session=%s turn=%s source=%s monitor_to_tg_ms=%s telegram_api_ms=%s end_to_end_ms=%s chats=%s/%s dedup=%s",
+                etype,
+                session_id,
+                str(event.get("turn_id", "")),
+                monitor_source,
+                monitor_to_tg_ms,
+                total_api_ms,
+                end_to_end_ms,
+                successful_chats,
+                len(target_chats),
+                dedup_key or "-",
+            )
 
     def _render_pending_question_message(
         self,

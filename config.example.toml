@@ -28,6 +28,15 @@ sessions_root = "~/.codex/sessions"
 scan_interval_sec = 2
 backfill_lines = 3000
 
+[monitor.watch]
+enabled = true
+fallback_scan_interval_sec = 30
+debounce_ms = 150
+max_batch_events = 200
+legacy_attach_log_cooldown_sec = 1800
+latency_log_enabled = true
+latency_warn_ms = 1500
+
 [notify]
 enabled_triggers = ["task_complete", "request_user_input", "proposed_plan_ready"]
 

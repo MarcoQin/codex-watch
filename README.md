@@ -8,6 +8,7 @@ Local monitor + multi-channel bridge (Telegram + Slack) for multiple Codex sessi
   - `task_complete`
   - `request_user_input`
   - `proposed_plan_ready` (detected by `<proposed_plan>` + round completion)
+- Uses hybrid monitoring by default: `watchdog` realtime events + low-frequency fallback scan.
 - Supports managed sessions launched via `tmux` (`codex-watch run ...`).
 - Supports Telegram commands to interact with managed sessions:
   - `/menu`, `/sessions`, `/select`, `/status`, `/routes`, `/set_default`, `/bind_session`, `/unbind_session`, `/view`, `/send`, `/mode`, `/clear`, `/approve`, `/reject`
@@ -37,6 +38,7 @@ Local monitor + multi-channel bridge (Telegram + Slack) for multiple Codex sessi
 - `tmux`
 - Telegram bot token
 - `tomli` (for Python 3.9)
+- `watchdog` (filesystem watch for low-latency session detection)
 
 Install dependency:
 
@@ -91,6 +93,15 @@ retry_enter_enabled = true
 retry_enter_delay_ms = 250
 retry_enter_count = 1
 view_lines = 80
+
+[monitor.watch]
+enabled = true
+fallback_scan_interval_sec = 30
+debounce_ms = 150
+max_batch_events = 200
+legacy_attach_log_cooldown_sec = 1800
+latency_log_enabled = true
+latency_warn_ms = 1500
 ```
 
 3. Start daemon:
@@ -217,6 +228,9 @@ tail -f ~/.local/state/codex-watch/codex-watch.log
 
 - Dedup key: `session_id + turn_id + trigger_type`.
 - Old sessions are auto-discovered from `~/.codex/sessions`.
+- Monitor mode defaults to hybrid watch: realtime file events + 30s fallback scan; if `watchdog` is unavailable it auto-falls back to polling.
+- Legacy auto-attach skip logs are rate-limited to reduce noise (`legacy_attach_log_cooldown_sec`).
+- End-to-end delivery latency logs are emitted in debug/warn (`latency_log_enabled`, `latency_warn_ms`).
 - Control commands only work for managed sessions with active tmux panes.
 - Managed session health checks use `tmux_session + tmux_pane` together (prevents cross-session pane-id reuse false positives).
 - `sessions list` shows `orphan=yes/no` and `orphan_reason` when detected.

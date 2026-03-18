@@ -3,9 +3,11 @@ import datetime as dt
 import json
 import logging
 import os
+import queue
 import re
 import sqlite3
 import threading
+import time
 import collections
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -21,6 +23,15 @@ class SessionState:
     proposed_plan_turns: set = dataclasses.field(default_factory=set)
     assistant_text_by_turn: Dict[str, str] = dataclasses.field(default_factory=dict)
 
+
+@dataclasses.dataclass
+class PendingWatchPath:
+    event_type: str
+    first_seen_ms: int
+    last_seen_ms: int
+    coalesced_count: int = 1
+
+
 class SessionMonitor(threading.Thread):
     def __init__(self, cfg: Config, db: DB, bus: NotificationBus, stop_event: threading.Event):
         super().__init__(daemon=True)
@@ -29,73 +40,290 @@ class SessionMonitor(threading.Thread):
         self.bus = bus
         self.stop_event = stop_event
         self.states: Dict[str, SessionState] = {}
+        self.watch_enabled = bool(cfg.monitor_watch_enabled)
+        self.fallback_scan_interval_sec = cfg.monitor_watch_fallback_scan_interval_sec
+        self.watch_debounce_ms = cfg.monitor_watch_debounce_ms
+        self.watch_max_batch_events = cfg.monitor_watch_max_batch_events
+        self._watch_observer: Any = None
+        self._watch_queue: "queue.Queue[Tuple[str, str, int]]" = queue.Queue()
+        self._pending_watch_paths: Dict[str, PendingWatchPath] = {}
+        self._watch_runtime_active = False
+        self._watch_retry_disabled = False
+        self.legacy_attach_log_cooldown_sec = cfg.monitor_watch_legacy_attach_log_cooldown_sec
+        self.latency_log_enabled = cfg.monitor_watch_latency_log_enabled
+        self.latency_warn_ms = cfg.monitor_watch_latency_warn_ms
+        self._attach_skip_last_ts: Dict[str, int] = {}
+        self._attach_skip_suppressed: Dict[str, int] = {}
 
     def run(self) -> None:
-        logging.info("session monitor started")
-        while not self.stop_event.is_set():
-            try:
-                self.scan_once()
-            except Exception:
-                logging.exception("monitor scan failed")
-            self.stop_event.wait(self.cfg.scan_interval_sec)
-        logging.info("session monitor stopped")
+        mode = "hybrid-watch" if self.watch_enabled else "polling"
+        logging.info(
+            "session monitor started mode=%s scan_interval=%ss fallback_scan_interval=%ss debounce_ms=%s",
+            mode,
+            self.cfg.scan_interval_sec,
+            self.fallback_scan_interval_sec,
+            self.watch_debounce_ms,
+        )
 
-    def scan_once(self) -> None:
+        # Startup reconciliation so restart windows do not miss pending lines.
+        self._safe_scan_once(source="startup_scan")
+        if self.watch_enabled:
+            self._watch_runtime_active = self._start_watch_observer()
+            if not self._watch_runtime_active:
+                logging.warning("watch mode unavailable; using polling fallback only")
+
+        scan_interval = self.fallback_scan_interval_sec if self._watch_runtime_active else self.cfg.scan_interval_sec
+        next_scan_at = time.monotonic() + scan_interval
+
+        try:
+            while not self.stop_event.is_set():
+                if self._watch_runtime_active:
+                    self._drain_watch_events()
+                    self._flush_debounced_watch_events()
+                    scan_interval = self.fallback_scan_interval_sec
+                else:
+                    scan_interval = self.cfg.scan_interval_sec
+
+                now = time.monotonic()
+                if now >= next_scan_at:
+                    source = "fallback_scan" if self._watch_runtime_active else "poll_scan"
+                    self._safe_scan_once(source=source)
+                    if self.watch_enabled and not self._watch_runtime_active and not self._watch_retry_disabled:
+                        self._watch_runtime_active = self._start_watch_observer()
+                    next_scan_at = time.monotonic() + scan_interval
+
+                wait_cap = 0.2 if self._watch_runtime_active else max(1, self.cfg.scan_interval_sec)
+                wait_for = max(0.05, min(wait_cap, max(0.0, next_scan_at - time.monotonic())))
+                self.stop_event.wait(wait_for)
+        finally:
+            self._stop_watch_observer()
+            logging.info("session monitor stopped")
+
+    def _safe_scan_once(self, source: str) -> None:
+        try:
+            seen, touched = self.scan_once(source=source)
+            logging.debug("monitor scan source=%s files_seen=%s files_touched=%s", source, seen, touched)
+        except Exception:
+            logging.exception("monitor scan failed source=%s", source)
+
+    def _rate_limited_attach_skip_log(self, session_id: str, reason: str, message: str, *args: Any) -> None:
+        try:
+            formatted = message % args if args else message
+        except Exception:
+            formatted = f"{message} args={args!r}"
+        now = utc_ts()
+        key = f"{session_id}:{reason}"
+        last_ts = self._attach_skip_last_ts.get(key)
+        if last_ts is None or (now - last_ts) >= self.legacy_attach_log_cooldown_sec:
+            suppressed = self._attach_skip_suppressed.pop(key, 0)
+            self._attach_skip_last_ts[key] = now
+            if suppressed > 0:
+                logging.info(
+                    "%s (suppressed=%s in last %ss)",
+                    formatted,
+                    suppressed,
+                    self.legacy_attach_log_cooldown_sec,
+                )
+            else:
+                logging.info("%s", formatted)
+            return
+        self._attach_skip_suppressed[key] = self._attach_skip_suppressed.get(key, 0) + 1
+
+    @staticmethod
+    def _now_ms() -> int:
+        return int(time.time() * 1000)
+
+    def _is_rollout_path(self, file_path: str) -> bool:
+        name = os.path.basename(file_path)
+        return name.startswith("rollout-") and name.endswith(".jsonl")
+
+    def _enqueue_watch_event(self, event_type: str, file_path: str) -> None:
+        if not file_path:
+            return
+        if not self._is_rollout_path(file_path):
+            return
+        self._watch_queue.put((event_type, file_path, int(time.time() * 1000)))
+
+    def _drain_watch_events(self) -> int:
+        drained = 0
+        while drained < self.watch_max_batch_events:
+            try:
+                event_type, path, ts_ms = self._watch_queue.get_nowait()
+            except queue.Empty:
+                break
+            drained += 1
+            existing = self._pending_watch_paths.get(path)
+            if existing:
+                existing.event_type = event_type
+                existing.last_seen_ms = ts_ms
+                existing.coalesced_count += 1
+            else:
+                self._pending_watch_paths[path] = PendingWatchPath(
+                    event_type=event_type,
+                    first_seen_ms=ts_ms,
+                    last_seen_ms=ts_ms,
+                )
+        if drained:
+            logging.debug("watch events drained=%s pending_paths=%s", drained, len(self._pending_watch_paths))
+        return drained
+
+    def _flush_debounced_watch_events(self) -> int:
+        if not self._pending_watch_paths:
+            return 0
+        now_ms = int(time.time() * 1000)
+        ready_paths = [
+            path
+            for path, info in self._pending_watch_paths.items()
+            if now_ms - info.last_seen_ms >= self.watch_debounce_ms
+        ]
+        processed = 0
+        for path in ready_paths:
+            info = self._pending_watch_paths.pop(path, None)
+            if not info:
+                continue
+            self._process_rollout_file(Path(path), source=f"watch_{info.event_type}")
+            processed += 1
+            logging.debug(
+                "watch processed path=%s event_type=%s coalesced=%s lag_ms=%s",
+                path,
+                info.event_type,
+                info.coalesced_count,
+                max(0, now_ms - info.first_seen_ms),
+            )
+        return processed
+
+    def _start_watch_observer(self) -> bool:
         root = Path(self.cfg.sessions_root)
         if not root.exists():
+            logging.warning("sessions root not found for watch: %s", root)
+            return False
+        try:
+            from watchdog.events import FileSystemEventHandler
+            from watchdog.observers import Observer
+        except Exception as e:
+            logging.warning("watchdog unavailable: %s", e)
+            self._watch_retry_disabled = True
+            return False
+
+        monitor = self
+
+        class RolloutEventHandler(FileSystemEventHandler):
+            def on_created(self, event: Any) -> None:
+                if getattr(event, "is_directory", False):
+                    return
+                monitor._enqueue_watch_event("create", str(getattr(event, "src_path", "")))
+
+            def on_modified(self, event: Any) -> None:
+                if getattr(event, "is_directory", False):
+                    return
+                monitor._enqueue_watch_event("modify", str(getattr(event, "src_path", "")))
+
+            def on_moved(self, event: Any) -> None:
+                if getattr(event, "is_directory", False):
+                    return
+                monitor._enqueue_watch_event("move", str(getattr(event, "dest_path", "")))
+
+        try:
+            observer = Observer()
+            observer.schedule(RolloutEventHandler(), str(root), recursive=True)
+            observer.start()
+            self._watch_observer = observer
+            logging.info("watch observer started root=%s", root)
+            return True
+        except Exception:
+            logging.exception("failed to start watch observer")
+            self._watch_observer = None
+            return False
+
+    def _stop_watch_observer(self) -> None:
+        observer = self._watch_observer
+        if observer is None:
             return
+        self._watch_observer = None
+        try:
+            observer.stop()
+            observer.join(timeout=3)
+            logging.info("watch observer stopped")
+        except Exception:
+            logging.exception("failed to stop watch observer cleanly")
+
+    def scan_once(self, source: str = "scan") -> Tuple[int, int]:
+        root = Path(self.cfg.sessions_root)
+        if not root.exists():
+            return 0, 0
 
         files = sorted(root.rglob("rollout-*.jsonl"))
-        now = utc_ts()
+        touched = 0
         for file_path in files:
-            f = str(file_path)
-            try:
-                stat = file_path.stat()
-            except FileNotFoundError:
-                continue
+            if self._process_rollout_file(file_path, source=source):
+                touched += 1
+        return len(files), touched
 
+    def _process_rollout_file(self, file_path: Path, source: str) -> bool:
+        f = str(file_path)
+        try:
+            stat = file_path.stat()
+        except FileNotFoundError:
+            return False
+
+        rec = self.db.get_session_file(f)
+        now = utc_ts()
+        is_new_file = rec is None
+        if rec is None:
+            is_old = int(stat.st_mtime) < (now - 120)
+            skip_history = 1 if is_old else 0
+            offset = int(stat.st_size) if is_old else 0
+            should_backfill = is_old and self.cfg.backfill_lines > 0
+            self.db.upsert_session_file(
+                file_path=f,
+                last_offset=offset,
+                skip_history=skip_history,
+                backfill_done=0 if should_backfill else 1,
+                last_mtime=int(stat.st_mtime),
+            )
+            self._parse_session_meta_if_needed(f)
             rec = self.db.get_session_file(f)
             if rec is None:
-                is_old = int(stat.st_mtime) < (now - 120)
-                skip_history = 1 if is_old else 0
-                offset = int(stat.st_size) if is_old else 0
-                should_backfill = is_old and self.cfg.backfill_lines > 0
-                self.db.upsert_session_file(
-                    file_path=f,
-                    last_offset=offset,
-                    skip_history=skip_history,
-                    backfill_done=0 if should_backfill else 1,
-                    last_mtime=int(stat.st_mtime),
-                )
-                self._parse_session_meta_if_needed(f)
-                rec = self.db.get_session_file(f)
-                if rec is None:
-                    continue
-            else:
-                self._parse_session_meta_if_needed(f)
+                return False
+        else:
+            self._parse_session_meta_if_needed(f)
 
-            if int(rec["backfill_done"]) == 0:
-                if self.cfg.backfill_lines > 0:
-                    self._backfill_file(f, self.cfg.backfill_lines)
-                self.db.mark_session_file_backfill_done(f)
-                rec = self.db.get_session_file(f)
-                if rec is None:
-                    continue
+        backfilled = False
+        if int(rec["backfill_done"]) == 0:
+            if self.cfg.backfill_lines > 0:
+                self._backfill_file(f, self.cfg.backfill_lines)
+            self.db.mark_session_file_backfill_done(f)
+            rec = self.db.get_session_file(f)
+            if rec is None:
+                return False
+            backfilled = True
 
-            offset = int(rec["last_offset"])
-            if stat.st_size < offset:
-                offset = 0
+        offset = int(rec["last_offset"])
+        original_offset = offset
+        if stat.st_size < offset:
+            offset = 0
 
-            with file_path.open("r", encoding="utf-8", errors="replace") as fh:
-                fh.seek(offset)
-                while True:
-                    line = fh.readline()
-                    if not line:
-                        break
-                    offset = fh.tell()
-                    self._handle_line(f, line, mode="live")
+        with file_path.open("r", encoding="utf-8", errors="replace") as fh:
+            fh.seek(offset)
+            while True:
+                line = fh.readline()
+                if not line:
+                    break
+                offset = fh.tell()
+                self._handle_line(f, line, mode="live", source=source)
 
-            self.db.update_session_file_offset(f, offset, int(stat.st_mtime))
+        self.db.update_session_file_offset(f, offset, int(stat.st_mtime))
+        touched = is_new_file or backfilled or (offset != original_offset)
+        if touched:
+            logging.debug(
+                "processed rollout source=%s path=%s new=%s backfilled=%s bytes_delta=%s",
+                source,
+                f,
+                is_new_file,
+                backfilled,
+                max(0, offset - original_offset),
+            )
+        return touched
 
     def _parse_session_meta_if_needed(self, file_path: str) -> None:
         rec = self.db.get_session_file(file_path)
@@ -188,14 +416,18 @@ class SessionMonitor(threading.Thread):
                 logging.info("attached existing session_id %s -> alias %s strategy=%s", session_id_str, alias, attach_reason)
         else:
             if launch_nonce:
-                logging.info(
+                self._rate_limited_attach_skip_log(
+                    session_id_str,
+                    attach_reason,
                     "existing session %s not auto-attached (launch_nonce=%s, reason=%s)",
                     session_id_str,
                     launch_nonce,
                     attach_reason,
                 )
             else:
-                logging.info(
+                self._rate_limited_attach_skip_log(
+                    session_id_str,
+                    attach_reason,
                     "existing session %s not auto-attached (missing launch_nonce, reason=%s)",
                     session_id_str,
                     attach_reason,
@@ -295,7 +527,7 @@ class SessionMonitor(threading.Thread):
         if not tail:
             return
         for line in tail:
-            self._handle_line(file_path, line, mode="backfill")
+            self._handle_line(file_path, line, mode="backfill", source="backfill")
 
     def _state_for(self, session_key: str) -> SessionState:
         if session_key not in self.states:
@@ -328,9 +560,31 @@ class SessionMonitor(threading.Thread):
             oldest = next(iter(state.assistant_text_by_turn))
             del state.assistant_text_by_turn[oldest]
 
-    def _emit_once(self, dedup_key: str, event: Dict[str, Any]) -> None:
+    def _publish_event(
+        self,
+        event: Dict[str, Any],
+        line_seen_ms: Optional[int],
+        source: str,
+        dedup_key: Optional[str],
+    ) -> None:
+        emitted_ms = self._now_ms()
+        event["_monitor_emitted_at_ms"] = emitted_ms
+        event["_monitor_source"] = source
+        if line_seen_ms is not None:
+            event["_monitor_line_seen_at_ms"] = line_seen_ms
+        if dedup_key:
+            event["_monitor_dedup_key"] = dedup_key
+        self.bus.publish(event)
+
+    def _emit_once(
+        self,
+        dedup_key: str,
+        event: Dict[str, Any],
+        line_seen_ms: Optional[int] = None,
+        source: str = "unknown",
+    ) -> None:
         if self.db.add_dedup(dedup_key):
-            self.bus.publish(event)
+            self._publish_event(event, line_seen_ms=line_seen_ms, source=source, dedup_key=dedup_key)
 
     def _format_assistant_text_parts(
         self,
@@ -356,10 +610,11 @@ class SessionMonitor(threading.Thread):
         # Keep full assistant text; Telegram side handles chunk splitting.
         return normalized, ""
 
-    def _handle_line(self, file_path: str, line: str, mode: str = "live") -> None:
+    def _handle_line(self, file_path: str, line: str, mode: str = "live", source: str = "unknown") -> None:
         text = line.strip()
         if not text:
             return
+        line_seen_ms = self._now_ms()
         try:
             data = json.loads(text)
         except json.JSONDecodeError:
@@ -418,10 +673,7 @@ class SessionMonitor(threading.Thread):
                             event["assistant_text"] = primary
                         if continued:
                             event["assistant_text_continued"] = continued
-                    self._emit_once(
-                        dedup,
-                        event,
-                    )
+                    self._emit_once(dedup, event, line_seen_ms=line_seen_ms, source=source)
 
                 if "proposed_plan_ready" in self.cfg.enabled_triggers and turn in state.proposed_plan_turns:
                     dedup = f"{session_key}:{turn}:proposed_plan_ready"
@@ -447,7 +699,7 @@ class SessionMonitor(threading.Thread):
                                 event["assistant_text"] = primary
                             if continued:
                                 event["assistant_text_continued"] = continued
-                        self.bus.publish(event)
+                        self._publish_event(event, line_seen_ms=line_seen_ms, source=source, dedup_key=dedup)
                     state.proposed_plan_turns.discard(turn)
                 return
 
@@ -474,7 +726,7 @@ class SessionMonitor(threading.Thread):
                         kind="request_user_input",
                         payload={"arguments": args, "call_id": call_id},
                     )
-                    self.bus.publish(
+                    self._publish_event(
                         {
                             "type": "request_user_input",
                             "session_id": session_key,
@@ -482,7 +734,10 @@ class SessionMonitor(threading.Thread):
                             "pending_id": pending_id,
                             "payload_hash": payload_hash,
                             "arguments": args,
-                        }
+                        },
+                        line_seen_ms=line_seen_ms,
+                        source=source,
+                        dedup_key=dedup,
                     )
                 return
 
