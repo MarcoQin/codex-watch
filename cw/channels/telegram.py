@@ -232,6 +232,10 @@ class TelegramService(threading.Thread):
             {"command": "sessions", "description": "List/select managed sessions"},
             {"command": "select", "description": "Select a managed session"},
             {"command": "status", "description": "Show selected session status"},
+            {"command": "routes", "description": "Show alias->chat routes"},
+            {"command": "set_default", "description": "Set this chat as default route"},
+            {"command": "bind_session", "description": "Bind alias route: /bind_session <alias>"},
+            {"command": "unbind_session", "description": "Unbind alias route: /unbind_session <alias>"},
             {"command": "view", "description": "View tmux screen + controls"},
             {"command": "mode", "description": "Switch mode: /mode plan"},
             {"command": "clear", "description": "Send /clear to selected session"},
@@ -251,7 +255,7 @@ class TelegramService(threading.Thread):
         return {
             "keyboard": [
                 [{"text": "Sessions"}, {"text": "Select"}, {"text": "Status"}, {"text": "View"}],
-                [{"text": "Help"}, {"text": "Plan"}, {"text": "Clear"}],
+                [{"text": "Help"}, {"text": "/mode plan"}, {"text": "/clear"}],
             ],
             "resize_keyboard": True,
             "is_persistent": True,
@@ -296,6 +300,43 @@ class TelegramService(threading.Thread):
             if row:
                 return str(row["alias"])
         return None
+
+    def _get_default_chat_id(self) -> Optional[int]:
+        raw = self.db.get_kv("telegram.default_chat_id")
+        if raw is None:
+            return None
+        try:
+            value = int(str(raw).strip())
+        except ValueError:
+            logging.warning("invalid telegram.default_chat_id in kv: %r", raw)
+            return None
+        if value <= 0:
+            return None
+        return value
+
+    def _set_default_chat_id(self, chat_id: int) -> None:
+        self.db.set_kv("telegram.default_chat_id", str(chat_id))
+
+    def _resolve_event_target_chats(self, bound_chats: List[int], alias: str) -> List[int]:
+        if not bound_chats:
+            return []
+        bound_sorted = sorted(bound_chats)
+        bound_set = set(bound_sorted)
+
+        if alias:
+            routed_chat = self.db.get_session_route_chat(alias)
+            if routed_chat is not None:
+                if routed_chat in bound_set:
+                    return [routed_chat]
+                logging.warning("telegram route points to unbound chat alias=%s chat_id=%s", alias, routed_chat)
+
+        default_chat = self._get_default_chat_id()
+        if default_chat is not None and default_chat in bound_set:
+            return [default_chat]
+
+        fallback = bound_sorted[0]
+        self._set_default_chat_id(fallback)
+        return [fallback]
 
     def _render_sessions_page(self, chat_id: int, page: int) -> Tuple[str, Optional[Dict[str, Any]], int]:
         managed = self._managed_sessions_sorted()
@@ -527,7 +568,11 @@ class TelegramService(threading.Thread):
 
         session_id = str(event.get("session_id", ""))
         managed = self.db.get_managed_by_session_id(session_id)
+        alias = str(managed["alias"] or "").strip() if managed else ""
         session_label = f"{managed['alias']} ({session_id})" if managed else session_id
+        target_chats = self._resolve_event_target_chats(chats, alias)
+        if not target_chats:
+            return
 
         etype = event.get("type")
         text = ""
@@ -598,7 +643,7 @@ class TelegramService(threading.Thread):
         else:
             text = f"[Codex] event: {etype}\n{json.dumps(event, ensure_ascii=True)}"
 
-        for chat_id in chats:
+        for chat_id in target_chats:
             try:
                 self._reply(chat_id, text, reply_markup=keyboard, rich=rich)
                 if continued_text:
@@ -973,13 +1018,18 @@ class TelegramService(threading.Thread):
                 "<code>/sessions</code>\n"
                 "<code>/select &lt;alias|session_id&gt;</code>\n"
                 "<code>/status</code>\n"
+                "<code>/routes</code>\n"
+                "<code>/set_default</code>\n"
+                "<code>/bind_session &lt;alias&gt;</code>\n"
+                "<code>/unbind_session &lt;alias&gt;</code>\n"
                 "<code>/view</code>\n"
                 "<code>/send &lt;text&gt;</code>\n"
                 "<code>/mode &lt;plan&gt;</code>\n"
                 "<code>/clear</code>\n"
                 "<code>/approve</code>\n"
                 "<code>/reject</code>\n\n"
-                "<i>Tip: plain text (without leading /) is sent to the selected managed session.</i>",
+                "<i>Tip: plain text (without leading /) is sent to the selected managed session.</i>\n"
+                "<i>Group note: if plain text is ignored, your bot privacy mode is likely ON. Use /send or disable privacy via BotFather (/setprivacy).</i>",
                 reply_markup=self._main_menu_keyboard(),
                 rich=True,
             )
@@ -998,6 +1048,8 @@ class TelegramService(threading.Thread):
                 self._reply(chat_id, f"<b>Bind failed:</b> {self._h(msg)}", rich=True)
                 return
             self.db.bind_chat(chat_id, username)
+            if self._get_default_chat_id() is None:
+                self._set_default_chat_id(chat_id)
             self._send_main_menu(chat_id, "Bind success. Use buttons or commands to control sessions.")
             return
 
@@ -1042,6 +1094,61 @@ class TelegramService(threading.Thread):
 
         if cmd == "/status":
             self._reply(chat_id, self._format_selected_status_html(chat_id), rich=True)
+            return
+
+        if cmd == "/routes":
+            default_chat_id = self._get_default_chat_id()
+            routes = self.db.list_session_routes()
+            lines = ["<b>[Codex] telegram routes</b>"]
+            lines.append(
+                self._kv_html("default chat", default_chat_id if default_chat_id is not None else "(unset)", code=default_chat_id is not None)
+            )
+            if not routes:
+                lines.append("<i>- no alias routes</i>")
+            else:
+                for idx, row in enumerate(routes, start=1):
+                    alias = str(row["alias"] or "")
+                    route_chat = int(row["chat_id"])
+                    suffix = " <i>(default)</i>" if default_chat_id is not None and route_chat == default_chat_id else ""
+                    lines.append(f"<b>{idx}.</b> <code>{self._h(alias)}</code> -> <code>{route_chat}</code>{suffix}")
+            self._reply(chat_id, "\n".join(lines), rich=True)
+            return
+
+        if cmd == "/set_default":
+            self._set_default_chat_id(chat_id)
+            self._reply(chat_id, "<b>Default route chat updated to this chat.</b>", rich=True)
+            return
+
+        if cmd == "/bind_session":
+            alias = arg.split(maxsplit=1)[0].strip() if arg else ""
+            if not alias:
+                self._reply(chat_id, "Usage: <code>/bind_session &lt;alias&gt;</code>", rich=True)
+                return
+            row = self.db.get_managed_by_alias(alias)
+            if not row:
+                self._reply(chat_id, f"<b>Alias not found:</b> <code>{self._h(alias)}</code>", rich=True)
+                return
+            self.db.set_session_route(alias, chat_id)
+            self.db.set_selected_session(chat_id, f"alias:{alias}")
+            self._reply(
+                chat_id,
+                f"<b>Route updated:</b> <code>{self._h(alias)}</code> -> <code>{chat_id}</code>\n"
+                f"<b>Selected:</b> <code>alias:{self._h(alias)}</code>\n"
+                "<i>Group note: if plain text still does not reach bot, use /send or disable bot privacy via BotFather (/setprivacy).</i>",
+                rich=True,
+            )
+            return
+
+        if cmd == "/unbind_session":
+            alias = arg.split(maxsplit=1)[0].strip() if arg else ""
+            if not alias:
+                self._reply(chat_id, "Usage: <code>/unbind_session &lt;alias&gt;</code>", rich=True)
+                return
+            removed = self.db.remove_session_route(alias)
+            if removed:
+                self._reply(chat_id, f"<b>Route removed:</b> <code>{self._h(alias)}</code>", rich=True)
+            else:
+                self._reply(chat_id, f"<b>No route found:</b> <code>{self._h(alias)}</code>", rich=True)
             return
 
         if cmd == "/view":

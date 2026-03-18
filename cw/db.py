@@ -34,6 +34,13 @@ class DB:
                     updated_at INTEGER NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS tg_session_routes (
+                    alias TEXT PRIMARY KEY,
+                    chat_id INTEGER NOT NULL,
+                    bound_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS managed_sessions (
                     alias TEXT PRIMARY KEY,
                     tmux_session TEXT NOT NULL,
@@ -164,6 +171,7 @@ class DB:
         with self.lock:
             self.conn.execute("DELETE FROM tg_bindings WHERE chat_id=?", (chat_id,))
             self.conn.execute("DELETE FROM chat_state WHERE chat_id=?", (chat_id,))
+            self.conn.execute("DELETE FROM tg_session_routes WHERE chat_id=?", (chat_id,))
             self.conn.commit()
 
     def is_chat_bound(self, chat_id: int) -> bool:
@@ -296,8 +304,49 @@ class DB:
     def delete_managed_session(self, alias: str) -> bool:
         with self.lock:
             cur = self.conn.execute("DELETE FROM managed_sessions WHERE alias=?", (alias,))
+            self.conn.execute("DELETE FROM tg_session_routes WHERE alias=?", (alias,))
             self.conn.commit()
             return cur.rowcount > 0
+
+    def set_session_route(self, alias: str, chat_id: int) -> None:
+        now = utc_ts()
+        with self.lock:
+            self.conn.execute(
+                """
+                INSERT INTO tg_session_routes(alias, chat_id, bound_at, updated_at)
+                VALUES(?, ?, ?, ?)
+                ON CONFLICT(alias) DO UPDATE SET
+                    chat_id=excluded.chat_id,
+                    updated_at=excluded.updated_at
+                """,
+                (alias, chat_id, now, now),
+            )
+            self.conn.commit()
+
+    def remove_session_route(self, alias: str) -> bool:
+        with self.lock:
+            cur = self.conn.execute("DELETE FROM tg_session_routes WHERE alias=?", (alias,))
+            self.conn.commit()
+            return cur.rowcount > 0
+
+    def get_session_route_chat(self, alias: str) -> Optional[int]:
+        with self.lock:
+            cur = self.conn.execute("SELECT chat_id FROM tg_session_routes WHERE alias=?", (alias,))
+            row = cur.fetchone()
+            if not row or row[0] is None:
+                return None
+            return int(row[0])
+
+    def list_session_routes(self) -> List[sqlite3.Row]:
+        with self.lock:
+            cur = self.conn.execute(
+                """
+                SELECT alias, chat_id, bound_at, updated_at
+                FROM tg_session_routes
+                ORDER BY updated_at DESC, alias ASC
+                """
+            )
+            return cur.fetchall()
 
     def upsert_session_file(
         self,

@@ -10,7 +10,7 @@ Local monitor + multi-channel bridge (Telegram + Slack) for multiple Codex sessi
   - `proposed_plan_ready` (detected by `<proposed_plan>` + round completion)
 - Supports managed sessions launched via `tmux` (`codex-watch run ...`).
 - Supports Telegram commands to interact with managed sessions:
-  - `/menu`, `/sessions`, `/select`, `/status`, `/view`, `/send`, `/mode`, `/clear`, `/approve`, `/reject`
+  - `/menu`, `/sessions`, `/select`, `/status`, `/routes`, `/set_default`, `/bind_session`, `/unbind_session`, `/view`, `/send`, `/mode`, `/clear`, `/approve`, `/reject`
 - Supports Slack notifications (Free workspace compatible) via `chat.postMessage`:
   - `task_complete`
   - `request_user_input`
@@ -24,6 +24,7 @@ Local monitor + multi-channel bridge (Telegram + Slack) for multiple Codex sessi
 - `task_complete` and `proposed_plan_ready` assistant text are forwarded in full (no monitor-side truncation).
 - Assistant Markdown in Telegram notifications is auto-rendered (common syntax subset).
 - Multi-channel event fan-out: one monitor event can be delivered to Telegram and Slack at the same time.
+- Telegram session routing supports alias -> chat mapping (with default chat fallback for unmapped aliases).
 - `/sessions` and `/select` support inline clickable managed-session picker with pagination.
 - Plain text (without leading `/`) is sent to the selected managed session.
 - `default` mode switching is not supported via chat in this Codex environment.
@@ -147,6 +148,10 @@ Notes:
 - `/sessions`
 - `/select <alias|session_id>`
 - `/status`
+- `/routes`
+- `/set_default`
+- `/bind_session <alias>`
+- `/unbind_session <alias>`
 - `/view`
 - `/send <text>`
 - `/mode <plan>`
@@ -159,9 +164,13 @@ Notes:
 /view sends a tmux text snapshot with inline controls: `↑ ↓ ← → Enter` + `Refresh`.
 Any non-command text is forwarded to the currently selected managed session.
 Image/file messages are not supported yet; the bot prompts you to send text or an image link with context.
+Use `/bind_session <alias>` in a target chat/group to route that managed session's notifications to this chat.
+Use `/routes` to inspect mappings and `/set_default` to set this chat as fallback for unmapped aliases.
+Note: a single Telegram bot has only one private chat per user; use multiple groups/chats if you want per-session separation.
+In groups, if direct plain text is ignored, bot privacy mode is likely ON. Use `/send <text>` or disable privacy in BotFather (`/setprivacy` -> `Disable`).
 For `proposed_plan_ready`, `/approve` sends `Enter`; `/reject` sends `Down` then delayed `Enter`.
 `/clear` sends `/clear` to the selected session using the configured delayed Enter tmux policy.
-Main menu keeps quick buttons for `Sessions/Select/Status/View/Help/Plan/Clear`; `Approve/Reject` are command or inline-plan buttons only.
+Main menu keeps quick buttons for `Sessions/Select/Status/View/Help` and command-style buttons `/mode plan` `/clear`; `Approve/Reject` are command or inline-plan buttons only.
 
 ## Slack Setup (Free)
 
@@ -215,6 +224,7 @@ tail -f ~/.local/state/codex-watch/codex-watch.log
 - `sessions prune` removes orphan managed sessions in bulk (`--dry-run` to preview; running orphans require `--force`).
 - Telegram inline approve/option callbacks can auto-remap legacy pending sessions to a unique running managed session by same `cwd`.
 - Auto-attach no longer uses `cwd` fallback to avoid wrong binding when multiple sessions share the same `cwd`.
+- Telegram notifications are routed by alias mapping when configured (`/bind_session`), otherwise sent to default chat (`/set_default`).
 - If a pane disappears, managed session status is marked as `stopped`.
 - Telegram `update_offset` is persisted in SQLite (`kv_store`).
 - Tmux send behavior is configurable; default uses `keys` mode with delayed Enter + one retry Enter.
