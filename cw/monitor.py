@@ -33,6 +33,10 @@ class PendingWatchPath:
 
 
 class SessionMonitor(threading.Thread):
+    SESSION_ID_PATTERN = re.compile(
+        r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+    )
+
     def __init__(self, cfg: Config, db: DB, bus: NotificationBus, stop_event: threading.Event):
         super().__init__(daemon=True)
         self.cfg = cfg
@@ -267,12 +271,25 @@ class SessionMonitor(threading.Thread):
         except FileNotFoundError:
             return False
         signature = (int(stat.st_mtime), int(stat.st_size))
-        if self._unmanaged_rollout_signatures.get(f) == signature:
+        prev_unmanaged_same_signature = self._unmanaged_rollout_signatures.get(f) == signature
+        if prev_unmanaged_same_signature and not self._should_track_rollout_file(file_path):
             return False
-        if not self._should_track_rollout_file(file_path):
-            logging.debug("skip unmanaged rollout source=%s path=%s", source, f)
-            self._unmanaged_rollout_signatures[f] = signature
-            return False
+
+        should_track = self._should_track_rollout_file(file_path)
+        if not should_track:
+            # Parse meta and retry once so freshly rotated sessions do not miss first pending events.
+            self._parse_session_meta_if_needed(f)
+            should_track = self._should_track_rollout_file(file_path)
+            if should_track:
+                logging.info("attach retry success source=%s path=%s", source, f)
+            else:
+                if not prev_unmanaged_same_signature:
+                    logging.debug("skip unmanaged rollout source=%s path=%s reason=not_managed_after_attach_retry", source, f)
+                self._unmanaged_rollout_signatures[f] = signature
+                return False
+        elif prev_unmanaged_same_signature:
+            logging.debug("previously unmanaged rollout now trackable source=%s path=%s", source, f)
+
         self._unmanaged_rollout_signatures.pop(f, None)
 
         rec = self.db.get_session_file(f)
@@ -339,7 +356,46 @@ class SessionMonitor(threading.Thread):
         name = file_path.name
         if not name.startswith("rollout-") or not name.endswith(".jsonl"):
             return ""
-        return name[len("rollout-") : -len(".jsonl")].strip()
+        stem = name[len("rollout-") : -len(".jsonl")].strip()
+        if not stem:
+            return ""
+        # Support both legacy rollout names (rollout-<session_id>.jsonl) and
+        # current names (rollout-<timestamp>-<session_id>.jsonl).
+        matches = list(SessionMonitor.SESSION_ID_PATTERN.finditer(stem))
+        if not matches:
+            return ""
+        match = matches[-1]
+        if match.end() != len(stem):
+            return ""
+        return match.group(0)
+
+    def _session_id_from_session_meta(self, file_path: str) -> Optional[str]:
+        path = Path(file_path)
+        if not path.exists():
+            return None
+        try:
+            with path.open("r", encoding="utf-8", errors="replace") as fh:
+                first = fh.readline()
+        except OSError:
+            return None
+        if not first.strip():
+            return None
+        try:
+            data = json.loads(first)
+        except json.JSONDecodeError:
+            return None
+        if data.get("type") != "session_meta":
+            return None
+        payload = data.get("payload", {}) if isinstance(data.get("payload"), dict) else {}
+        raw_id = payload.get("id")
+        if not isinstance(raw_id, str):
+            return None
+        sid = raw_id.strip()
+        if not sid:
+            return None
+        if not self.SESSION_ID_PATTERN.fullmatch(sid):
+            return None
+        return sid
 
     def _should_track_rollout_file(self, file_path: Path) -> bool:
         session_id_from_name = self._session_id_from_rollout_name(file_path)
@@ -347,6 +403,14 @@ class SessionMonitor(threading.Thread):
             if self.db.has_managed_session_id(session_id_from_name):
                 return True
             snapshot_nonce = self._extract_launch_nonce_from_snapshot(session_id_from_name)
+            if snapshot_nonce and self.db.has_managed_launch_nonce(snapshot_nonce):
+                return True
+
+        session_id_from_meta = self._session_id_from_session_meta(str(file_path))
+        if session_id_from_meta:
+            if self.db.has_managed_session_id(session_id_from_meta):
+                return True
+            snapshot_nonce = self._extract_launch_nonce_from_snapshot(session_id_from_meta)
             if snapshot_nonce and self.db.has_managed_launch_nonce(snapshot_nonce):
                 return True
 

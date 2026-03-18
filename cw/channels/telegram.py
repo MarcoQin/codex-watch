@@ -865,17 +865,16 @@ class TelegramService(threading.Thread):
             return
 
         label = str(option.get("label", ""))
-        label_send = self._clean_option_label(label)
-        ok, msg = self._send_to_session(resolved_session_id, label_send)
+        ok, msg = self._send_request_user_input_option_keys(resolved_session_id, idx)
         if not ok:
-            self.api.answer_callback_query(cb_id, f"Failed: {msg[:80]}")
+            self.api.answer_callback_query(cb_id, f"Failed: {msg[:56]} | refocus Codex and retry")
             return
 
         answer_entry = {
             "question_index": question_idx,
             "option_index": idx,
             "label": label,
-            "sent_text": label_send,
+            "sent_text": f"[keys] option {idx + 1}",
             "answered_at": utc_ts(),
         }
         progressed, done, next_idx, progress_msg = self.db.advance_pending_request_user_input(
@@ -1325,6 +1324,39 @@ class TelegramService(threading.Thread):
                 self.tmux.send_special_key(pane, "C-m")
         except subprocess.CalledProcessError as e:
             return False, e.stderr.strip() or "tmux send failed"
+        return True, "ok"
+
+    def _send_request_user_input_option_keys(self, session_id: str, option_index: int) -> Tuple[bool, str]:
+        if option_index < 0:
+            return False, "invalid option index"
+
+        alias_hint = None
+        if session_id.startswith("alias::"):
+            alias_hint = session_id.split("::", 1)[1]
+
+        row = self.db.get_managed_by_session_id(session_id) if alias_hint is None else self.db.get_managed_by_alias(alias_hint)
+        if not row:
+            return False, "session is not managed"
+        tmux_session = str(row["tmux_session"] or "").strip()
+        pane = str(row["tmux_pane"] or "").strip()
+        if not tmux_session:
+            return False, "missing tmux session"
+        if not pane:
+            return False, "missing tmux pane"
+        if (not self.tmux.session_exists(tmux_session)) or (not self.tmux.pane_belongs_to_session(tmux_session, pane)):
+            self.db.update_managed_status_by_alias(str(row["alias"]), "stopped")
+            return False, "tmux session/pane not running"
+
+        try:
+            # request_user_input options are selected from the currently focused option.
+            for _ in range(option_index):
+                self.tmux.send_special_key(pane, "Down")
+                delay_ms = max(0, int(self.tmux_send_policy.enter_delay_ms))
+                if delay_ms > 0:
+                    time.sleep(delay_ms / 1000.0)
+            self.tmux.send_special_key(pane, "C-m")
+        except subprocess.CalledProcessError as e:
+            return False, e.stderr.strip() or "tmux key send failed"
         return True, "ok"
 
     def _split_command(self, text: str) -> Tuple[str, str]:
