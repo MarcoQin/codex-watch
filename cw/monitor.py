@@ -134,25 +134,37 @@ class SessionMonitor(threading.Thread):
             if nonce_conflict:
                 logging.warning("session %s nonce conflict detected; refusing auto-attach", session_id)
                 return
-            alias = self.db.maybe_attach_session_id(
+            alias, attach_reason = self.db.maybe_attach_session_id(
                 str(session_id),
                 str(cwd) if cwd else None,
                 session_ts,
                 launch_nonce,
             )
             if alias:
-                logging.info("attached session_id %s -> alias %s", session_id, alias)
+                if attach_reason == "nonce_rotate":
+                    logging.info("reattached session_id %s -> alias %s strategy=%s", session_id, alias, attach_reason)
+                else:
+                    logging.info("attached session_id %s -> alias %s strategy=%s", session_id, alias, attach_reason)
             else:
-                if launch_nonce:
+                if attach_reason in ("nonce_ambiguous_unbound", "nonce_ambiguous_existing"):
                     logging.info(
-                        "session %s not auto-attached in strict nonce mode (launch_nonce=%s, no unique match)",
+                        "session %s not auto-attached in strict nonce mode (launch_nonce=%s, reason=%s)",
                         session_id,
                         launch_nonce,
+                        attach_reason,
+                    )
+                elif launch_nonce:
+                    logging.info(
+                        "session %s not auto-attached in strict nonce mode (launch_nonce=%s, reason=%s)",
+                        session_id,
+                        launch_nonce,
+                        attach_reason,
                     )
                 else:
                     logging.info(
-                        "session %s not auto-attached in strict nonce mode (missing launch_nonce), use manual attach if needed",
+                        "session %s not auto-attached in strict nonce mode (missing launch_nonce, reason=%s), use manual attach if needed",
                         session_id,
+                        attach_reason,
                     )
 
     def _try_attach_existing_session(self, rec: sqlite3.Row) -> None:
@@ -168,9 +180,26 @@ class SessionMonitor(threading.Thread):
         if nonce_conflict:
             logging.warning("session %s nonce conflict detected on existing attach path", session_id_str)
             return
-        alias = self.db.maybe_attach_session_id(session_id_str, cwd_val, None, launch_nonce)
+        alias, attach_reason = self.db.maybe_attach_session_id(session_id_str, cwd_val, None, launch_nonce)
         if alias:
-            logging.info("attached existing session_id %s -> alias %s", session_id_str, alias)
+            if attach_reason == "nonce_rotate":
+                logging.info("reattached existing session_id %s -> alias %s strategy=%s", session_id_str, alias, attach_reason)
+            else:
+                logging.info("attached existing session_id %s -> alias %s strategy=%s", session_id_str, alias, attach_reason)
+        else:
+            if launch_nonce:
+                logging.info(
+                    "existing session %s not auto-attached (launch_nonce=%s, reason=%s)",
+                    session_id_str,
+                    launch_nonce,
+                    attach_reason,
+                )
+            else:
+                logging.info(
+                    "existing session %s not auto-attached (missing launch_nonce, reason=%s)",
+                    session_id_str,
+                    attach_reason,
+                )
 
     def _resolve_launch_nonce(self, file_path: str, session_id: str) -> Tuple[Optional[str], bool]:
         content_nonce = self._extract_launch_nonce_from_session_content(file_path)

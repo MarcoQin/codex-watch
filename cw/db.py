@@ -1,5 +1,6 @@
 import hashlib
 import json
+import logging
 import sqlite3
 import threading
 from typing import Any, Dict, List, Optional, Tuple
@@ -252,39 +253,92 @@ class DB:
         cwd: Optional[str],
         session_ts: Optional[int],
         launch_nonce: Optional[str],
-    ) -> Optional[str]:
+    ) -> Tuple[Optional[str], str]:
         with self.lock:
-            if launch_nonce:
-                cur = self.conn.execute(
-                    """
-                    SELECT alias FROM managed_sessions
-                    WHERE codex_session_id IS NULL
-                      AND launch_nonce=?
-                    ORDER BY created_at DESC
-                    LIMIT 2
-                    """,
-                    (launch_nonce,),
-                )
-                rows = cur.fetchall()
-                if len(rows) == 1:
-                    alias = str(rows[0][0])
-                    self.conn.execute(
-                        "UPDATE managed_sessions SET codex_session_id=?, last_seen_at=? WHERE alias=?",
-                        (session_id, utc_ts(), alias),
-                    )
-                    self.conn.commit()
-                    return alias
-                if len(rows) > 1:
-                    for row in rows:
-                        self.conn.execute(
-                            "UPDATE managed_sessions SET status='awaiting_manual_attach', last_seen_at=? WHERE alias=?",
-                            (utc_ts(), str(row[0])),
-                    )
-                    self.conn.commit()
-                    return None
+            sid = str(session_id).strip()
+            nonce = str(launch_nonce).strip() if launch_nonce else ""
+            if not sid:
+                return None, "missing_session_id"
+            if not nonce:
+                return None, "missing_launch_nonce"
 
-            # Strict mode: auto-attach only with launch_nonce.
-            return None
+            now = utc_ts()
+
+            # 1) First try strict attach to a unique unbound managed row by nonce.
+            cur_unbound = self.conn.execute(
+                """
+                SELECT alias
+                FROM managed_sessions
+                WHERE codex_session_id IS NULL
+                  AND launch_nonce=?
+                ORDER BY created_at DESC
+                """,
+                (nonce,),
+            )
+            unbound_rows = cur_unbound.fetchall()
+            if len(unbound_rows) == 1:
+                alias = str(unbound_rows[0][0])
+                self.conn.execute(
+                    "UPDATE managed_sessions SET codex_session_id=?, last_seen_at=? WHERE alias=?",
+                    (sid, now, alias),
+                )
+                self.conn.commit()
+                return alias, "nonce_unbound"
+            if len(unbound_rows) > 1:
+                for row in unbound_rows:
+                    self.conn.execute(
+                        "UPDATE managed_sessions SET status='awaiting_manual_attach', last_seen_at=? WHERE alias=?",
+                        (now, str(row[0])),
+                    )
+                self.conn.commit()
+                return None, "nonce_ambiguous_unbound"
+
+            # 2) Rotate attach: same nonce uniquely identifies an existing managed alias.
+            cur_nonce_all = self.conn.execute(
+                """
+                SELECT alias, codex_session_id
+                FROM managed_sessions
+                WHERE launch_nonce=?
+                ORDER BY created_at DESC
+                """,
+                (nonce,),
+            )
+            nonce_rows = cur_nonce_all.fetchall()
+            if len(nonce_rows) == 1:
+                alias = str(nonce_rows[0][0])
+                current_sid = str(nonce_rows[0][1] or "").strip()
+                if current_sid == sid:
+                    # already attached to the same session id
+                    return alias, "already_attached"
+
+                # If sid is already attached elsewhere, do not rebind automatically.
+                cur_sid_owner = self.conn.execute(
+                    "SELECT alias FROM managed_sessions WHERE codex_session_id=?",
+                    (sid,),
+                )
+                sid_owner = cur_sid_owner.fetchone()
+                if sid_owner and str(sid_owner[0]) != alias:
+                    logging.warning(
+                        "skip nonce rotate attach sid=%s nonce=%s alias=%s reason=sid_owned_by_other owner=%s",
+                        sid,
+                        nonce,
+                        alias,
+                        str(sid_owner[0]),
+                    )
+                    return None, "sid_owned_by_other"
+
+                self.conn.execute(
+                    "UPDATE managed_sessions SET codex_session_id=?, last_seen_at=? WHERE alias=?",
+                    (sid, now, alias),
+                )
+                self.conn.commit()
+                return alias, "nonce_rotate"
+
+            if len(nonce_rows) > 1:
+                # Ambiguous nonce across multiple managed aliases; do not auto-attach.
+                return None, "nonce_ambiguous_existing"
+
+            return None, "nonce_not_found"
 
     def get_managed_by_alias(self, alias: str) -> Optional[sqlite3.Row]:
         with self.lock:
