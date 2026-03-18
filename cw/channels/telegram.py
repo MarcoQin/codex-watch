@@ -152,9 +152,10 @@ class TelegramService(threading.Thread):
     def run(self) -> None:
         logging.info("telegram service started")
         logging.info(
-            "telegram network api_base=%s proxy=%s connect_timeout=%ss read_timeout=%ss request_timeout=%ss",
+            "telegram network api_base=%s proxy=%s get_updates_timeout=%ss connect_timeout=%ss read_timeout=%ss request_timeout=%ss",
             self.api.api_base_root,
             self.api.proxy_for_log,
+            self.cfg.telegram_get_updates_timeout_sec,
             self.api.connect_timeout_sec,
             self.api.read_timeout_sec,
             self.api.request_timeout_sec,
@@ -167,7 +168,7 @@ class TelegramService(threading.Thread):
         while not self.stop_event.is_set():
             try:
                 self._flush_events(limit=50)
-                updates = self.api.get_updates(self.update_offset, timeout=15)
+                updates = self.api.get_updates(self.update_offset, timeout=self.cfg.telegram_get_updates_timeout_sec)
                 for upd in updates:
                     update_id = int(upd["update_id"])
                     next_offset = update_id + 1
@@ -491,8 +492,6 @@ class TelegramService(threading.Thread):
             return None, f"Selected alias {alias} is waiting for codex_session_id."
         row, msg = self._resolve_view_target_by_session_id(session_id)
         if not row:
-            if msg == "session is not managed":
-                return None, "Selected session is legacy (notify-only). Use /sessions."
             return None, msg
         return row, "ok"
 
@@ -829,12 +828,9 @@ class TelegramService(threading.Thread):
             return
 
         session_id = str(pending["session_id"] or "")
-        resolved_session_id, resolved_managed, resolve_reason = self._resolve_pending_target_session(session_id)
+        resolved_session_id, resolved_managed, _resolve_reason = self._resolve_pending_target_session(session_id)
         if not resolved_session_id:
-            if resolve_reason == "non_unique_cwd":
-                self.api.answer_callback_query(cb_id, "Pending session ambiguous; use /select then retry")
-            else:
-                self.api.answer_callback_query(cb_id, "Pending session not managed; use /select then retry")
+            self.api.answer_callback_query(cb_id, "Pending session not managed; use /select then retry")
             return
         try:
             payload = json.loads(str(pending["payload_json"]))
@@ -942,12 +938,9 @@ class TelegramService(threading.Thread):
             self.api.answer_callback_query(cb_id, "Missing session id")
             return
 
-        resolved_session_id, resolved_managed, resolve_reason = self._resolve_pending_target_session(session_id)
+        resolved_session_id, resolved_managed, _resolve_reason = self._resolve_pending_target_session(session_id)
         if not resolved_session_id:
-            if resolve_reason == "non_unique_cwd":
-                self.api.answer_callback_query(cb_id, "Pending session ambiguous; use /select then retry")
-            else:
-                self.api.answer_callback_query(cb_id, "Pending session not managed; use /select then retry")
+            self.api.answer_callback_query(cb_id, "Pending session not managed; use /select then retry")
             return
 
         managed = resolved_managed or self.db.get_managed_by_session_id(resolved_session_id)
@@ -983,45 +976,8 @@ class TelegramService(threading.Thread):
             )
             return session_id, managed, "direct_managed"
 
-        discovered = self.db.get_discovered_session(session_id)
-        if not discovered:
-            logging.info("pending session unresolved source=%s reason=not_discovered", session_id)
-            return None, None, "not_discovered"
-
-        cwd = str(discovered["cwd"] or "").strip()
-        if not cwd:
-            logging.info("pending session unresolved source=%s reason=missing_cwd", session_id)
-            return None, None, "missing_cwd"
-
-        candidates = self.db.list_running_managed_by_cwd(cwd)
-        if len(candidates) != 1:
-            logging.info(
-                "pending session unresolved source=%s reason=non_unique_cwd cwd=%s candidates=%s",
-                session_id,
-                cwd,
-                len(candidates),
-            )
-            return None, None, "non_unique_cwd"
-
-        mapped = candidates[0]
-        mapped_sid = str(mapped["codex_session_id"] or "").strip()
-        if not mapped_sid:
-            logging.info(
-                "pending session unresolved source=%s reason=candidate_without_sid cwd=%s alias=%s",
-                session_id,
-                cwd,
-                str(mapped["alias"] or ""),
-            )
-            return None, None, "candidate_without_sid"
-
-        logging.info(
-            "pending session remapped source=%s resolved=%s strategy=cwd_unique_remap alias=%s cwd=%s",
-            session_id,
-            mapped_sid,
-            str(mapped["alias"] or ""),
-            cwd,
-        )
-        return mapped_sid, mapped, "cwd_unique_remap"
+        logging.info("pending session unresolved source=%s reason=not_managed", session_id)
+        return None, None, "not_managed"
 
     def _handle_message(self, message: Dict[str, Any]) -> None:
         chat = message.get("chat", {}) if isinstance(message.get("chat"), dict) else {}
@@ -1347,7 +1303,7 @@ class TelegramService(threading.Thread):
 
         row = self.db.get_managed_by_session_id(session_id) if alias_hint is None else self.db.get_managed_by_alias(alias_hint)
         if not row:
-            return False, "session is not managed (legacy session is notify-only)"
+            return False, "session is not managed"
         tmux_session = str(row["tmux_session"] or "").strip()
         pane = str(row["tmux_pane"] or "").strip()
         if not tmux_session:
@@ -1740,11 +1696,6 @@ class TelegramService(threading.Thread):
         m2 = self.db.get_managed_by_session_id(value)
         if m2:
             return f"session:{value}"
-        discovered = self.db.list_discovered_sessions()
-        for row in discovered:
-            sid = row["session_id"]
-            if sid and str(sid) == value:
-                return f"session:{value}"
         return None
 
     def _selected_session_id(self, chat_id: int) -> Optional[str]:
@@ -1770,7 +1721,7 @@ class TelegramService(threading.Thread):
 
         row = self.db.get_managed_by_session_id(session_id) if alias_hint is None else self.db.get_managed_by_alias(alias_hint)
         if not row:
-            return False, "session is not managed (legacy session is notify-only)"
+            return False, "session is not managed"
 
         tmux_session = str(row["tmux_session"] or "").strip()
         pane = str(row["tmux_pane"] or "").strip()
@@ -1832,7 +1783,7 @@ class TelegramService(threading.Thread):
             lines.append(f"managed alias: {row['alias']}")
             lines.append(f"status: {row['status']}")
         else:
-            lines.append("session mode: legacy (notify-only)")
+            lines.append("session is not managed")
 
         pendings = self.db.get_pending_for_session(session_id)
         lines.append(f"pending items: {len(pendings)}")
@@ -1868,7 +1819,7 @@ class TelegramService(threading.Thread):
             lines.append(self._kv_html("managed alias", row["alias"]))
             lines.append(self._kv_html("status", row["status"]))
         else:
-            lines.append(self._kv_html("session mode", "legacy (notify-only)"))
+            lines.append(self._kv_html("session", "not managed"))
 
         pendings = self.db.get_pending_for_session(session_id)
         lines.append(self._kv_html("pending items", len(pendings)))

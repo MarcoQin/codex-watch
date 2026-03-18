@@ -11,6 +11,7 @@ from .cli import (
     cmd_init_config,
     cmd_run_session,
     cmd_sessions_attach,
+    cmd_sessions_cleanup_legacy,
     cmd_sessions_list,
     cmd_sessions_prune,
     cmd_sessions_rm,
@@ -62,9 +63,11 @@ def main(argv):
             if args.sessions_cmd == "attach":
                 return cmd_sessions_attach(args, db)
             if args.sessions_cmd == "rm":
-                return cmd_sessions_rm(args, db)
+                return cmd_sessions_rm(args, cfg, db)
             if args.sessions_cmd == "prune":
                 return cmd_sessions_prune(args, db)
+            if args.sessions_cmd == "cleanup-legacy":
+                return cmd_sessions_cleanup_legacy(args, db)
         return 1
     finally:
         db.close()

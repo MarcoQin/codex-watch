@@ -54,6 +54,7 @@ class SessionMonitor(threading.Thread):
         self.latency_warn_ms = cfg.monitor_watch_latency_warn_ms
         self._attach_skip_last_ts: Dict[str, int] = {}
         self._attach_skip_suppressed: Dict[str, int] = {}
+        self._unmanaged_rollout_signatures: Dict[str, Tuple[int, int]] = {}
 
     def run(self) -> None:
         mode = "hybrid-watch" if self.watch_enabled else "polling"
@@ -265,6 +266,14 @@ class SessionMonitor(threading.Thread):
             stat = file_path.stat()
         except FileNotFoundError:
             return False
+        signature = (int(stat.st_mtime), int(stat.st_size))
+        if self._unmanaged_rollout_signatures.get(f) == signature:
+            return False
+        if not self._should_track_rollout_file(file_path):
+            logging.debug("skip unmanaged rollout source=%s path=%s", source, f)
+            self._unmanaged_rollout_signatures[f] = signature
+            return False
+        self._unmanaged_rollout_signatures.pop(f, None)
 
         rec = self.db.get_session_file(f)
         now = utc_ts()
@@ -324,6 +333,34 @@ class SessionMonitor(threading.Thread):
                 max(0, offset - original_offset),
             )
         return touched
+
+    @staticmethod
+    def _session_id_from_rollout_name(file_path: Path) -> str:
+        name = file_path.name
+        if not name.startswith("rollout-") or not name.endswith(".jsonl"):
+            return ""
+        return name[len("rollout-") : -len(".jsonl")].strip()
+
+    def _should_track_rollout_file(self, file_path: Path) -> bool:
+        session_id_from_name = self._session_id_from_rollout_name(file_path)
+        if session_id_from_name:
+            if self.db.has_managed_session_id(session_id_from_name):
+                return True
+            snapshot_nonce = self._extract_launch_nonce_from_snapshot(session_id_from_name)
+            if snapshot_nonce and self.db.has_managed_launch_nonce(snapshot_nonce):
+                return True
+
+        rec = self.db.get_session_file(str(file_path))
+        if rec:
+            sid = str(rec["session_id"] or "").strip()
+            if sid and self.db.has_managed_session_id(sid):
+                return True
+
+        content_nonce = self._extract_launch_nonce_from_session_content(str(file_path), max_lines=120)
+        if content_nonce and self.db.has_managed_launch_nonce(content_nonce):
+            return True
+
+        return False
 
     def _parse_session_meta_if_needed(self, file_path: str) -> None:
         rec = self.db.get_session_file(file_path)
@@ -656,11 +693,16 @@ class SessionMonitor(threading.Thread):
                 if mode == "live" and "task_complete" in self.cfg.enabled_triggers:
                     dedup = f"{session_key}:{turn}:task_complete"
                     assistant_text = self._clean_text(state.assistant_text_by_turn.get(turn))
-                    source = "state"
+                    text_source = "state"
                     if not assistant_text:
                         assistant_text = self._clean_text(payload.get("last_agent_message"))
-                        source = "last_agent_message" if assistant_text else "none"
-                    logging.debug("task_complete notify text source session=%s turn=%s source=%s", session_key, turn, source)
+                        text_source = "last_agent_message" if assistant_text else "none"
+                    logging.debug(
+                        "task_complete notify text source session=%s turn=%s source=%s",
+                        session_key,
+                        turn,
+                        text_source,
+                    )
                     event: Dict[str, Any] = {
                         "type": "task_complete",
                         "session_id": session_key,

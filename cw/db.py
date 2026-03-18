@@ -350,6 +350,28 @@ class DB:
             cur = self.conn.execute("SELECT * FROM managed_sessions WHERE codex_session_id=?", (session_id,))
             return cur.fetchone()
 
+    def has_managed_session_id(self, session_id: str) -> bool:
+        sid = str(session_id or "").strip()
+        if not sid:
+            return False
+        with self.lock:
+            cur = self.conn.execute(
+                "SELECT 1 FROM managed_sessions WHERE codex_session_id=? LIMIT 1",
+                (sid,),
+            )
+            return cur.fetchone() is not None
+
+    def has_managed_launch_nonce(self, launch_nonce: str) -> bool:
+        nonce = str(launch_nonce or "").strip()
+        if not nonce:
+            return False
+        with self.lock:
+            cur = self.conn.execute(
+                "SELECT 1 FROM managed_sessions WHERE launch_nonce=? LIMIT 1",
+                (nonce,),
+            )
+            return cur.fetchone() is not None
+
     def list_managed_sessions(self) -> List[sqlite3.Row]:
         with self.lock:
             cur = self.conn.execute("SELECT * FROM managed_sessions ORDER BY created_at DESC")
@@ -712,3 +734,60 @@ class DB:
                 (utc_ts(), pending_id),
             )
             self.conn.commit()
+
+    def cleanup_legacy_records(self, dry_run: bool = False) -> Dict[str, int]:
+        managed_sid_subquery = (
+            "SELECT codex_session_id FROM managed_sessions "
+            "WHERE codex_session_id IS NOT NULL AND codex_session_id!=''"
+        )
+        legacy_session_predicate = (
+            "session_id IS NULL OR session_id='' OR "
+            f"session_id NOT IN ({managed_sid_subquery})"
+        )
+        dedup_prefix = (
+            "CASE "
+            "WHEN instr(dedup_key, ':') > 0 THEN substr(dedup_key, 1, instr(dedup_key, ':') - 1) "
+            "ELSE dedup_key END"
+        )
+        legacy_dedup_predicate = (
+            f"{dedup_prefix} IS NULL OR {dedup_prefix}='' OR "
+            f"{dedup_prefix} NOT IN ({managed_sid_subquery})"
+        )
+        legacy_chat_session_predicate = (
+            "selected_session_ref LIKE 'session:%' AND "
+            "substr(selected_session_ref, 9) NOT IN "
+            f"({managed_sid_subquery})"
+        )
+
+        with self.lock:
+            cur = self.conn.cursor()
+
+            cur.execute(f"SELECT COUNT(*) FROM session_files WHERE {legacy_session_predicate}")
+            session_files = int(cur.fetchone()[0])
+
+            cur.execute(f"SELECT COUNT(*) FROM pending_inputs WHERE {legacy_session_predicate}")
+            pending_inputs = int(cur.fetchone()[0])
+
+            cur.execute(f"SELECT COUNT(*) FROM dedup_events WHERE {legacy_dedup_predicate}")
+            dedup_events = int(cur.fetchone()[0])
+
+            cur.execute(f"SELECT COUNT(*) FROM chat_state WHERE {legacy_chat_session_predicate}")
+            chat_state = int(cur.fetchone()[0])
+
+            result = {
+                "session_files": session_files,
+                "pending_inputs": pending_inputs,
+                "dedup_events": dedup_events,
+                "chat_state": chat_state,
+                "total": session_files + pending_inputs + dedup_events + chat_state,
+            }
+
+            if dry_run:
+                return result
+
+            cur.execute(f"DELETE FROM session_files WHERE {legacy_session_predicate}")
+            cur.execute(f"DELETE FROM pending_inputs WHERE {legacy_session_predicate}")
+            cur.execute(f"DELETE FROM dedup_events WHERE {legacy_dedup_predicate}")
+            cur.execute(f"DELETE FROM chat_state WHERE {legacy_chat_session_predicate}")
+            self.conn.commit()
+            return result

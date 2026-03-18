@@ -44,11 +44,15 @@ class Config:
     tmux_retry_enter_delay_ms: int
     tmux_retry_enter_count: int
     tmux_view_lines: int
+    tmux_stop_graceful_command: str
+    tmux_stop_graceful_timeout_sec: int
+    tmux_stop_kill_on_timeout: bool
 
     enabled_channels: List[str]
 
     telegram_bot_token: str
     telegram_proxy_url: str
+    telegram_get_updates_timeout_sec: int
     telegram_connect_timeout_sec: int
     telegram_read_timeout_sec: int
     telegram_api_base: str
@@ -97,6 +101,7 @@ def load_config(path: str) -> Config:
 
     telegram_bot_token = str(deep_get(raw, ["telegram", "bot_token"], "")).strip()
     telegram_proxy_url = str(deep_get(raw, ["telegram", "proxy_url"], "")).strip()
+    telegram_get_updates_timeout_sec = int(deep_get(raw, ["telegram", "get_updates_timeout_sec"], 2))
     telegram_connect_timeout_sec = int(deep_get(raw, ["telegram", "connect_timeout_sec"], 10))
     telegram_read_timeout_sec = int(deep_get(raw, ["telegram", "read_timeout_sec"], 30))
     telegram_api_base = str(deep_get(raw, ["telegram", "api_base"], "https://api.telegram.org")).strip()
@@ -172,6 +177,9 @@ def load_config(path: str) -> Config:
     tmux_retry_enter_count = int(deep_get(raw, ["tmux", "retry_enter_count"], 1))
     tmux_retry_enter_count = 1 if tmux_retry_enter_count > 0 else 0
     tmux_view_lines = int(deep_get(raw, ["tmux", "view_lines"], 80))
+    tmux_stop_graceful_command = str(deep_get(raw, ["tmux", "stop_graceful_command"], "/quit")).strip()
+    tmux_stop_graceful_timeout_sec = int(deep_get(raw, ["tmux", "stop_graceful_timeout_sec"], 6))
+    tmux_stop_kill_on_timeout = bool(deep_get(raw, ["tmux", "stop_kill_on_timeout"], True))
 
     return Config(
         poll_interval_sec=max(1, poll_interval_sec),
@@ -200,9 +208,13 @@ def load_config(path: str) -> Config:
         tmux_retry_enter_delay_ms=max(0, tmux_retry_enter_delay_ms),
         tmux_retry_enter_count=tmux_retry_enter_count,
         tmux_view_lines=max(20, min(400, tmux_view_lines)),
+        tmux_stop_graceful_command=tmux_stop_graceful_command,
+        tmux_stop_graceful_timeout_sec=max(1, tmux_stop_graceful_timeout_sec),
+        tmux_stop_kill_on_timeout=tmux_stop_kill_on_timeout,
         enabled_channels=enabled_channels,
         telegram_bot_token=telegram_bot_token,
         telegram_proxy_url=telegram_proxy_url,
+        telegram_get_updates_timeout_sec=max(0, telegram_get_updates_timeout_sec),
         telegram_connect_timeout_sec=max(1, telegram_connect_timeout_sec),
         telegram_read_timeout_sec=max(1, telegram_read_timeout_sec),
         telegram_api_base=telegram_api_base or "https://api.telegram.org",
@@ -226,6 +238,7 @@ enabled = ["telegram"]
 bot_token = ""
 poll_interval_sec = 2
 proxy_url = ""
+get_updates_timeout_sec = 2
 connect_timeout_sec = 10
 read_timeout_sec = 30
 api_base = "https://api.telegram.org"
@@ -279,4 +292,7 @@ retry_enter_enabled = true
 retry_enter_delay_ms = 250
 retry_enter_count = 1
 view_lines = 80
+stop_graceful_command = "/quit"
+stop_graceful_timeout_sec = 6
+stop_kill_on_timeout = true
 """

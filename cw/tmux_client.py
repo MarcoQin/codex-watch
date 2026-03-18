@@ -46,6 +46,9 @@ class TmuxController:
         except subprocess.CalledProcessError:
             return False
 
+    def kill_session(self, session_name: str) -> None:
+        self._run_tmux(["kill-session", "-t", session_name], check=True)
+
     def pane_belongs_to_session(self, session_name: str, pane_id: str) -> bool:
         if not session_name or not pane_id:
             return False

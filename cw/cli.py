@@ -25,7 +25,7 @@ from .common import (
 from .config import Config, default_config_toml
 from .daemon import Daemon
 from .db import DB
-from .tmux_client import TmuxController, build_launch_nonce, build_tmux_session_name
+from .tmux_client import TmuxController, TmuxSendPolicy, build_launch_nonce, build_tmux_session_name
 
 
 def cmd_init_config(args: argparse.Namespace) -> int:
@@ -93,6 +93,16 @@ def _managed_tmux_health(row, tmux: TmuxController) -> Tuple[bool, Optional[str]
     return True, None
 
 
+def _tmux_send_policy_from_cfg(cfg: Config) -> TmuxSendPolicy:
+    return TmuxSendPolicy(
+        strategy=cfg.tmux_send_strategy,
+        enter_delay_ms=cfg.tmux_enter_delay_ms,
+        retry_enter_enabled=cfg.tmux_retry_enter_enabled,
+        retry_enter_delay_ms=cfg.tmux_retry_enter_delay_ms,
+        retry_enter_count=cfg.tmux_retry_enter_count,
+    )
+
+
 def cmd_sessions_list(db: DB) -> int:
     tmux = TmuxController()
     managed = db.list_managed_sessions()
@@ -109,17 +119,6 @@ def cmd_sessions_list(db: DB) -> int:
                 f"session_id={row['codex_session_id'] or '-'} tmux={row['tmux_session']} pane={row['tmux_pane']} "
                 f"orphan={orphan_flag} cwd={row['cwd']} nonce={row['launch_nonce'] or '-'}{reason}"
             )
-
-    managed_sids = {str(r["codex_session_id"]) for r in managed if r["codex_session_id"]}
-    discovered = db.list_discovered_sessions()
-    legacy = [row for row in discovered if str(row["session_id"]) not in managed_sids]
-
-    print("\nLegacy sessions (notify-only):")
-    if not legacy:
-        print("- none")
-    else:
-        for row in legacy[:50]:
-            print(f"- session_id={row['session_id']} cwd={row['cwd'] or '-'}")
 
     return 0
 
@@ -149,7 +148,7 @@ def cmd_sessions_attach(args: argparse.Namespace, db: DB) -> int:
     return 0
 
 
-def cmd_sessions_rm(args: argparse.Namespace, db: DB) -> int:
+def cmd_sessions_rm(args: argparse.Namespace, cfg: Config, db: DB) -> int:
     alias = args.name.strip()
     row = db.get_managed_by_alias(alias)
     if not row:
@@ -158,20 +157,69 @@ def cmd_sessions_rm(args: argparse.Namespace, db: DB) -> int:
 
     tmux = TmuxController()
     healthy, orphan_reason = _managed_tmux_health(row, tmux)
-    if healthy and not args.force:
-        print(
-            f"refusing to remove active session alias={alias}; use --force to override",
-            file=sys.stderr,
-        )
-        return 1
+    reason = orphan_reason or "orphan"
+    if healthy:
+        tmux_session = str(row["tmux_session"] or "").strip()
+        pane = str(row["tmux_pane"] or "").strip()
+        if args.force:
+            try:
+                tmux.kill_session(tmux_session)
+            except subprocess.CalledProcessError as e:
+                print(e.stderr.strip() or f"failed to kill tmux session: {tmux_session}", file=sys.stderr)
+                return 1
+            reason = "forced_kill"
+        else:
+            graceful_command = cfg.tmux_stop_graceful_command.strip()
+            if graceful_command:
+                try:
+                    tmux.send_text_with_policy(pane, graceful_command, _tmux_send_policy_from_cfg(cfg), enter=True)
+                except subprocess.CalledProcessError as e:
+                    print(e.stderr.strip() or "failed to send graceful stop command", file=sys.stderr)
+                    return 1
+
+            deadline = time.time() + max(1, int(cfg.tmux_stop_graceful_timeout_sec))
+            while time.time() < deadline:
+                if not tmux.session_exists(tmux_session):
+                    break
+                time.sleep(0.2)
+
+            if tmux.session_exists(tmux_session):
+                if not cfg.tmux_stop_kill_on_timeout:
+                    print(
+                        (
+                            f"graceful stop timeout alias={alias} after {cfg.tmux_stop_graceful_timeout_sec}s; "
+                            "session still active"
+                        ),
+                        file=sys.stderr,
+                    )
+                    return 1
+                try:
+                    tmux.kill_session(tmux_session)
+                except subprocess.CalledProcessError as e:
+                    print(e.stderr.strip() or f"failed to kill tmux session: {tmux_session}", file=sys.stderr)
+                    return 1
+                reason = "graceful_timeout_kill"
+            else:
+                reason = "graceful_stop"
 
     ok = db.delete_managed_session(alias)
     if not ok:
         print(f"remove failed: alias not found: {alias}", file=sys.stderr)
         return 1
 
-    reason = "forced" if healthy else (orphan_reason or "orphan")
     print(f"removed alias={alias} reason={reason}")
+    return 0
+
+
+def cmd_sessions_cleanup_legacy(args: argparse.Namespace, db: DB) -> int:
+    stats = db.cleanup_legacy_records(dry_run=args.dry_run)
+    mode = "dry-run" if args.dry_run else "cleanup"
+    print(f"{mode} legacy rows:")
+    print(f"- session_files={stats['session_files']}")
+    print(f"- pending_inputs={stats['pending_inputs']}")
+    print(f"- dedup_events={stats['dedup_events']}")
+    print(f"- chat_state={stats['chat_state']}")
+    print(f"- total={stats['total']}")
     return 0
 
 
@@ -320,6 +368,9 @@ def cmd_channels_status(cfg: Config) -> int:
     print(f"- retry_enter_delay_ms: {cfg.tmux_retry_enter_delay_ms}")
     print(f"- retry_enter_count: {cfg.tmux_retry_enter_count}")
     print(f"- view_lines: {cfg.tmux_view_lines}")
+    print(f"- stop_graceful_command: {cfg.tmux_stop_graceful_command or '-'}")
+    print(f"- stop_graceful_timeout_sec: {cfg.tmux_stop_graceful_timeout_sec}")
+    print(f"- stop_kill_on_timeout: {'yes' if cfg.tmux_stop_kill_on_timeout else 'no'}")
     return 0
 
 
@@ -350,6 +401,8 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     prune = sess_sub.add_parser("prune")
     prune.add_argument("--dry-run", action="store_true")
     prune.add_argument("--force", action="store_true")
+    cleanup_legacy = sess_sub.add_parser("cleanup-legacy")
+    cleanup_legacy.add_argument("--dry-run", action="store_true")
 
     auth = sub.add_parser("auth")
     auth_sub = auth.add_subparsers(dest="auth_cmd", required=True)
